@@ -1,0 +1,34 @@
+# FastAPI and server
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Data processing
+pydantic==2.5.0
+polars==0.19.19
+sqlalchemy==2.0.23
+
+# Database drivers
+# Note: psycopg2-binary 2.9.9 doesn't fully support Python 3.13
+# Latest available version is 2.9.11
+# For Python 3.13, consider using Python 3.11 or 3.12 for better compatibility
+# Or wait for psycopg2-binary to add Python 3.13 support
+psycopg2-binary==2.9.11
+pymongo==4.10.1
+pymysql==1.1.1  # MySQL driver
+
+# Environment
+python-dotenv==1.0.0
+
+# Singer taps (local connectors)
+# Note: These are installed from local connectors/ directories
+# Install with: pip install -e connectors/tap-postgres
+#               pip install -e connectors/tap-mysql
+#               pip install -e connectors/tap-mongodb
+
+# Singer core
+singer-python==6.3.0
+
+# Utilities
+python-jose[cryptography]==3.3.0  # For JWT validation
+python-dateutil==2.8.2
