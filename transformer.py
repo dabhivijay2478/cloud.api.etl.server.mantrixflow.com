@@ -16,45 +16,87 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # Restricted globals for safe execution
+# Use a copy of builtins to allow import statements
+import builtins
+
+# Create a safe builtins dict that allows common operations and imports
+SAFE_BUILTINS = {
+    # Safe builtins
+    'abs': abs,
+    'all': all,
+    'any': any,
+    'bool': bool,
+    'dict': dict,
+    'float': float,
+    'int': int,
+    'len': len,
+    'list': list,
+    'max': max,
+    'min': min,
+    'range': range,
+    'round': round,
+    'str': str,
+    'sum': sum,
+    'tuple': tuple,
+    'type': type,
+    'zip': zip,
+    'map': map,
+    'filter': filter,
+    'sorted': sorted,
+    'reversed': reversed,
+    'enumerate': enumerate,
+    'set': set,
+    'frozenset': frozenset,
+    'bytes': bytes,
+    'bytearray': bytearray,
+    'ord': ord,
+    'chr': chr,
+    'hex': hex,
+    'oct': oct,
+    'bin': bin,
+    'format': format,
+    'repr': repr,
+    'hash': hash,
+    'id': id,
+    'callable': callable,
+    'print': print,  # Allow print for debugging
+    # Type checking
+    'isinstance': isinstance,
+    'issubclass': issubclass,
+    'hasattr': hasattr,
+    'getattr': getattr,
+    'setattr': setattr,
+    'delattr': delattr,
+    # CRITICAL: Allow __import__ for import statements
+    '__import__': __import__,
+    # Exceptions
+    'ValueError': ValueError,
+    'TypeError': TypeError,
+    'KeyError': KeyError,
+    'AttributeError': AttributeError,
+    'IndexError': IndexError,
+    'Exception': Exception,
+    'RuntimeError': RuntimeError,
+    # Constants
+    'None': None,
+    'True': True,
+    'False': False,
+    # String formatting
+    '__name__': '__main__',
+}
+
+# Pre-import safe modules that scripts might use
+import datetime
+import re
+import math
+
 RESTRICTED_GLOBALS = {
-    '__builtins__': {
-        # Safe builtins only
-        'abs': abs,
-        'all': all,
-        'any': any,
-        'bool': bool,
-        'dict': dict,
-        'float': float,
-        'int': int,
-        'len': len,
-        'list': list,
-        'max': max,
-        'min': min,
-        'range': range,
-        'round': round,
-        'str': str,
-        'sum': sum,
-        'tuple': tuple,
-        'type': type,
-        'zip': zip,
-        # String methods
-        'str': str,
-        # Type checking
-        'isinstance': isinstance,
-        'hasattr': hasattr,
-        'getattr': getattr,
-        'setattr': setattr,
-        # Exceptions
-        'ValueError': ValueError,
-        'TypeError': TypeError,
-        'KeyError': KeyError,
-        'AttributeError': AttributeError,
-        # None
-        'None': None,
-        'True': True,
-        'False': False,
-    },
+    '__builtins__': SAFE_BUILTINS,
+    # Pre-imported modules for convenience
     'json': json,
+    'datetime': datetime,
+    're': re,
+    'math': math,
 }
 
 
