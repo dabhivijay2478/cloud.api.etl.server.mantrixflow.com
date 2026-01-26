@@ -33,5 +33,5 @@ singer-python==6.3.0
 python-jose[cryptography]==3.3.0  # For JWT validation
 python-dateutil==2.8.2
 
-# Serverless/ASGI adapter for Vercel
-mangum==0.17.0  # ASGI-to-serverless adapter for FastAPI on Vercel
+# Serverless/ASGI adapter for Vercel (@vercel/python builder)
+mangum==0.17.0  # Required for FastAPI on Vercel with @vercel/python builder

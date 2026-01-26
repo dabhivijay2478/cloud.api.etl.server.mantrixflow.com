@@ -42,3 +42,4 @@ logs/
 .env.production.local
 .env.local
 .vercel
+test.txt

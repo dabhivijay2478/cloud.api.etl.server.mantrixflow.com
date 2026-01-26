@@ -1,41 +1,24 @@
 """
 Vercel serverless function entrypoint for FastAPI ETL service.
 
-This file wraps the FastAPI app from main.py using Mangum,
-which provides an ASGI-to-AWS Lambda/API Gateway adapter.
-Vercel's Python runtime uses a similar interface.
+For @vercel/python builder, export the FastAPI app directly.
+Vercel's builder should handle FastAPI/ASGI apps automatically.
 """
 
 import os
 import sys
 from pathlib import Path
 
-# Add the parent directory to Python path so we can import main
-# This is needed because Vercel runs from api/ directory
+# Add the parent directory to Python path
 current_dir = Path(__file__).parent
 parent_dir = current_dir.parent
 sys.path.insert(0, str(parent_dir))
 
-# Set working directory to parent (where main.py, connectors/, etc. are)
+# Set working directory to parent
 os.chdir(parent_dir)
 
-# Import the FastAPI app from main.py
+# Import and export the FastAPI app
 from main import app
 
-# For Vercel, we need to export a handler function
-# Mangum wraps FastAPI ASGI app for serverless environments
-try:
-    from mangum import Mangum
-    
-    # Create Mangum handler wrapping the FastAPI app
-    handler = Mangum(app, lifespan="off")
-    
-except ImportError:
-    # Fallback: If mangum is not available, raise error with helpful message
-    raise ImportError(
-        "Mangum is required for Vercel deployment. "
-        "Install it with: pip install mangum==0.17.0"
-    )
-
-# Export handler for Vercel
-__all__ = ["handler"]
+# Export app for Vercel - the @vercel/python builder should detect FastAPI
+# If this doesn't work, we may need to use Mangum wrapper
