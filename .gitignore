@@ -1,9 +1,9 @@
 # Environment files
-.env
 .env.local
 .env.*.local
 .env.local.example
-
+*.env
+ 
 # Vercel
 .vercel/
 .vercelignore
@@ -34,3 +34,10 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
