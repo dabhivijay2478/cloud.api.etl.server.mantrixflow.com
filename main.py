@@ -67,15 +67,20 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# CORS middleware
-# Get allowed origins from environment variable (comma-separated)
-cors_origins_env = os.getenv("CORS_ORIGINS", "")
-if cors_origins_env:
-    # Parse comma-separated origins and strip whitespace
-    allowed_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
-else:
-    # Default: allow all origins in development, empty list in production
-    allowed_origins = ["*"] if os.getenv("LOG_LEVEL", "INFO") == "DEBUG" else []
+# CORS: only from environment (apps/etl/.env) — CORS_ORIGINS comma-separated
+# When allow_credentials=True, "*" is not allowed; use explicit origins in .env.
+cors_origins_env = os.getenv("CORS_ORIGINS", "").strip()
+allowed_origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+# Add localhost/127.0.0.1 variant for each so both work
+_extras = []
+for origin in allowed_origins:
+    if "localhost" in origin:
+        _extras.append(origin.replace("localhost", "127.0.0.1"))
+    elif "127.0.0.1" in origin:
+        _extras.append(origin.replace("127.0.0.1", "localhost"))
+for o in _extras:
+    if o not in allowed_origins:
+        allowed_origins.append(o)
 
 app.add_middleware(
     CORSMiddleware,
@@ -83,6 +88,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Security
