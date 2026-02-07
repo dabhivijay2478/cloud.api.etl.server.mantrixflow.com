@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+import uuid
 from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import quote_plus
 
@@ -246,9 +247,18 @@ def _catalog_arg_name(source_type: str) -> str:
     return "--properties" if source_type == "postgresql" else "--catalog"
 
 
-def _run_discovery_sync(source_type: str, singer_config: Dict[str, Any]) -> Dict[str, Any]:
+def _tap_env() -> Dict[str, str]:
+    """Build environment for Singer tap subprocesses."""
     env = os.environ.copy()
     env["PYTHONPATH"] = _tap_pythonpath()
+    # Ensure subprocesses can verify TLS certificates (fixes macOS CA issue).
+    env.setdefault("SSL_CERT_FILE", certifi.where())
+    env.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+    return env
+
+
+def _run_discovery_sync(source_type: str, singer_config: Dict[str, Any]) -> Dict[str, Any]:
+    env = _tap_env()
 
     with temporary_json_file(singer_config) as config_path:
         command = [*_tap_command(source_type), "--config", config_path, "--discover"]
@@ -262,8 +272,7 @@ def _run_collect_sync(
     selected_catalog: Dict[str, Any],
     state: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = _tap_pythonpath()
+    env = _tap_env()
 
     with temporary_json_file(singer_config) as config_path, temporary_json_file(selected_catalog) as catalog_path:
         command = [*_tap_command(source_type), "--config", config_path, _catalog_arg_name(source_type), catalog_path]
@@ -288,6 +297,50 @@ def _infer_sql_type(value: Any):
     if isinstance(value, (dict, list)):
         return JSON
     return Text
+
+
+def _sanitize_record_for_sql(record: Dict[str, Any], json_columns: set) -> Dict[str, Any]:
+    """Coerce MongoDB-style record values so PostgreSQL / MySQL can accept them.
+
+    * dict/list values destined for a non-JSON column are serialised to JSON strings.
+    * dict/list values for JSON columns are left as-is (SQLAlchemy handles them).
+    * ``decimal.Decimal`` is converted to ``float`` for broad driver compatibility.
+    """
+    import decimal
+
+    cleaned: Dict[str, Any] = {}
+    for key, value in record.items():
+        if isinstance(value, (dict, list)):
+            if key in json_columns:
+                cleaned[key] = value
+            else:
+                cleaned[key] = json.dumps(value, default=str)
+        elif isinstance(value, decimal.Decimal):
+            cleaned[key] = float(value)
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
+# Fixed namespace for deterministic ObjectId → UUID conversion.
+# Every MongoDB _id always maps to the same UUID.
+_MONGO_OID_NS = uuid.UUID("a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d")
+
+
+def _objectid_to_uuid(oid: str) -> str:
+    """Convert a MongoDB ObjectId hex string to a deterministic UUID v5."""
+    return str(uuid.uuid5(_MONGO_OID_NS, oid))
+
+
+def _is_uuid_column(col) -> bool:
+    """Check whether a SQLAlchemy column is a UUID / GUID type."""
+    from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+
+    col_type = col.type
+    type_str = str(col_type).upper()
+    if isinstance(col_type, PG_UUID):
+        return True
+    return type_str in ("UUID", "GUID")
 
 
 def _build_sqlalchemy_url(dest_type: str, connection_config: Dict[str, Any]) -> str:
@@ -341,16 +394,37 @@ def _prepare_sql_table(
     has_table = inspector.has_table(table_name, schema=schema_name if dest_type == "postgresql" else None)
 
     if not has_table:
+        # Scan ALL records (not just the first) to pick the most appropriate
+        # SQL type for each column.  A dict/list anywhere promotes to JSON;
+        # a float anywhere promotes BigInteger → Float, etc.
+        column_types: Dict[str, Any] = {}
+        all_keys: List[str] = []
+        seen_keys: set = set()
+        for rec in records:
+            for key, value in rec.items():
+                if not isinstance(key, str):
+                    continue
+                if key not in seen_keys:
+                    all_keys.append(key)
+                    seen_keys.add(key)
+                inferred = _infer_sql_type(value)
+                existing = column_types.get(key)
+                if existing is None:
+                    column_types[key] = inferred
+                elif existing is not inferred:
+                    # Widen: any conflict → Text (safest), but keep JSON if either is JSON.
+                    if inferred is JSON or existing is JSON:
+                        column_types[key] = JSON
+                    else:
+                        column_types[key] = Text
+
         columns: List[Column] = []
-        first_record = records[0]
-        for key, value in first_record.items():
-            if not isinstance(key, str):
-                continue
+        for key in all_keys:
             nullable = key not in upsert_keys
             columns.append(
                 Column(
                     key,
-                    _infer_sql_type(value),
+                    column_types[key],
                     primary_key=key in upsert_keys,
                     nullable=nullable,
                 )
@@ -386,9 +460,41 @@ def _emit_to_sql(
     if not records:
         return EmitResponse(rows_written=0, rows_skipped=0, rows_failed=0, errors=[])
 
+    # Pre-normalise field names before table creation so auto-created tables
+    # get ``id`` instead of ``_id`` and don't include ``_stream``.
+    for rec in records:
+        rec.pop("_stream", None)
+        if "_id" in rec and "id" not in rec:
+            rec["id"] = rec.pop("_id")
+
     engine = create_engine(_build_sqlalchemy_url(dest_type, connection_config), future=True, pool_pre_ping=True)
     table = _prepare_sql_table(engine, dest_type, table_name, schema_name, records, upsert_keys)
     table_columns = {column.name for column in table.columns}
+
+    # Build a set of column names whose SQL type is JSON so the sanitiser
+    # knows which values it can pass as dicts/lists.
+    json_columns: set = set()
+    for col in table.columns:
+        if isinstance(col.type, JSON):
+            json_columns.add(col.name)
+
+    # Convert ObjectId strings to deterministic UUIDs when the ``id`` column
+    # is UUID typed (common in pre-existing PostgreSQL tables).
+    id_is_uuid = False
+    for col in table.columns:
+        if col.name == "id" and _is_uuid_column(col):
+            id_is_uuid = True
+            break
+
+    if id_is_uuid:
+        for rec in records:
+            raw_id = rec.get("id")
+            if isinstance(raw_id, str) and len(raw_id) == 24:
+                try:
+                    int(raw_id, 16)  # validate it's hex
+                    rec["id"] = _objectid_to_uuid(raw_id)
+                except ValueError:
+                    pass  # not a hex ObjectId, leave as-is
 
     rows_written = 0
     rows_failed = 0
@@ -399,7 +505,7 @@ def _emit_to_sql(
     for item in records:
         cleaned = {key: value for key, value in item.items() if key in table_columns}
         if cleaned:
-            filtered_records.append(cleaned)
+            filtered_records.append(_sanitize_record_for_sql(cleaned, json_columns))
         else:
             rows_skipped += 1
 
@@ -445,6 +551,7 @@ def _emit_to_sql(
 
                 rows_written += len(batch)
             except Exception as exc:  # pragma: no cover - database-specific failures
+                etl_log.error("Emit batch failed: %s", exc, exc_info=True)
                 rows_failed += len(batch)
                 errors.append({"error": str(exc), "batch_size": len(batch)})
 

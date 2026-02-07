@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import unquote_plus, urlparse
 
 
 class ETLRuntimeError(RuntimeError):
@@ -38,6 +39,60 @@ def ensure_supported_source(source_type: str) -> str:
     return normalized
 
 
+def _parse_mongo_uri(uri: str) -> Dict[str, Any]:
+    """Parse a MongoDB connection string into individual config fields for Singer tap.
+
+    Handles both ``mongodb://`` and ``mongodb+srv://`` schemes.  For SRV URIs
+    the DNS SRV lookup is delegated to pymongo so we get the real shard hosts.
+    """
+    try:
+        from pymongo.uri_parser import parse_uri  # pymongo is already a dependency
+        parsed = parse_uri(uri)
+    except Exception:
+        # Fallback: basic urllib parsing when pymongo SRV resolution fails.
+        parsed_url = urlparse(uri)
+        return {
+            "host": parsed_url.hostname or "localhost",
+            "port": parsed_url.port or 27017,
+            "user": unquote_plus(parsed_url.username or ""),
+            "password": unquote_plus(parsed_url.password or ""),
+            "database": (parsed_url.path.lstrip("/") or "admin"),
+            "ssl": "true" if uri.startswith("mongodb+srv://") else "false",
+        }
+
+    nodelist = parsed.get("nodelist") or [("localhost", 27017)]
+    host = nodelist[0][0]
+    port = nodelist[0][1] or 27017
+
+    result: Dict[str, Any] = {
+        "host": host,
+        "port": port,
+    }
+    if parsed.get("username"):
+        result["user"] = parsed["username"]
+    if parsed.get("password"):
+        result["password"] = parsed["password"]
+
+    database = parsed.get("database")
+    result["database"] = database if database else "admin"
+
+    options = parsed.get("options") or {}
+    if options.get("replicaset"):
+        result["replica_set"] = options["replicaset"]
+    if options.get("authsource"):
+        result["auth_source"] = options["authsource"]
+
+    # mongodb+srv:// always implies TLS
+    if uri.startswith("mongodb+srv://"):
+        result["ssl"] = "true"
+        # Allow invalid certs so the tap can connect on systems where the
+        # local CA store is not found (e.g. macOS + Python).  The subprocess
+        # also receives SSL_CERT_FILE via the environment as a primary fix.
+        result.setdefault("verify_mode", "false")
+
+    return result
+
+
 def build_singer_config(
     source_type: str,
     connection_config: Dict[str, Any],
@@ -48,6 +103,19 @@ def build_singer_config(
     conn = connection_config or {}
 
     cfg: Dict[str, Any] = {}
+
+    # ── MongoDB: if a connection string is provided, parse it into individual
+    # fields so the Singer tap receives the required keys (host, port, user,
+    # password, database).
+    if source_type == "mongodb":
+        mongo_uri = (
+            conn.get("connection_string_mongo")
+            or conn.get("connection_string")
+        )
+        if mongo_uri and not conn.get("host"):
+            parsed = _parse_mongo_uri(mongo_uri)
+            # Seed cfg with parsed values; explicit conn fields override below.
+            cfg.update(parsed)
 
     # Common relational mapping.
     host = conn.get("host")
