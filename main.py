@@ -486,6 +486,7 @@ def _emit_to_sql(
             id_is_uuid = True
             break
 
+    has_id_column = "id" in table_columns
     if id_is_uuid:
         for rec in records:
             raw_id = rec.get("id")
@@ -495,6 +496,13 @@ def _emit_to_sql(
                     rec["id"] = _objectid_to_uuid(raw_id)
                 except ValueError:
                     pass  # not a hex ObjectId, leave as-is
+
+    # If the table has a UUID ``id`` column but the record has no id (e.g. transform
+    # dropped _id), generate a deterministic UUID so NOT NULL is satisfied.
+    if has_id_column and id_is_uuid:
+        for rec in records:
+            if rec.get("id") is None or rec.get("id") == "":
+                rec["id"] = str(uuid.uuid5(_MONGO_OID_NS, json.dumps(rec, sort_keys=True, default=str)))
 
     rows_written = 0
     rows_failed = 0
