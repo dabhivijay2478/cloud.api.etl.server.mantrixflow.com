@@ -613,12 +613,21 @@ async def collect(
             payload.checkpoint,
         )
     except ETLRuntimeError as exc:
-        mysql_auth_error = _humanize_mysql_auth_error(str(exc))
+        error_msg = str(exc)
+        activity("request.error", f"Singer collect failed for {normalized_source}: {error_msg[:500]}", level="error", source_type=normalized_source, metadata={
+            "table_name": payload.table_name, "sync_mode": payload.sync_mode,
+        })
+        mysql_auth_error = _humanize_mysql_auth_error(error_msg)
         if mysql_auth_error:
             raise HTTPException(status_code=400, detail=mysql_auth_error) from exc
-        raise HTTPException(status_code=502, detail=f"Singer collect failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Singer collect failed: {error_msg[:2000]}") from exc
     except ValueError as exc:
+        activity("request.error", f"Collect validation error: {exc}", level="warn", source_type=normalized_source)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        error_msg = str(exc)
+        activity("request.error", f"Unexpected collect error for {normalized_source}: {error_msg[:500]}", level="error", source_type=normalized_source)
+        raise HTTPException(status_code=500, detail=f"Internal collect error: {error_msg[:2000]}") from exc
 
     all_records = collect_result["records"]
     total_rows = len(all_records)
