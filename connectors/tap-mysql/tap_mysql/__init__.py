@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # pylint: disable=missing-docstring,not-an-iterable,too-many-locals,too-many-arguments,too-many-branches,invalid-name,duplicate-code,too-many-statements
 
+# Ensure distutils is available on Python 3.12+ (pymysqlreplication uses distutils.version)
+try:
+    import setuptools  # noqa: F401
+except ImportError:
+    pass
+
 import datetime
 import collections
 import itertools

@@ -5,6 +5,7 @@ import backoff
 import pymysql
 from pymysql.constants import CLIENT
 
+import re
 import singer
 import ssl
 
@@ -13,8 +14,51 @@ LOGGER = singer.get_logger()
 CONNECT_TIMEOUT_SECONDS = 30
 READ_TIMEOUT_SECONDS = 3600
 
-# We need to hold onto this for self-signed SSL
-match_hostname = ssl.match_hostname
+
+def _match_hostname_fallback(cert, hostname):
+    """Fallback for ssl.match_hostname when not in stdlib (e.g. Python 3.12+)."""
+    if not cert:
+        raise ssl.CertificateError("empty or no certificate")
+    dnsnames = []
+    san = cert.get("subjectAltName", ())
+    for key, value in san:
+        if key == "DNS":
+            if _dnsname_to_pattern(value).match(hostname):
+                return
+            dnsnames.append(value)
+    if not dnsnames:
+        # Subject common name only if no SAN
+        for key, value in cert.get("subject", ()):
+            if key == "commonName":
+                if _dnsname_to_pattern(value).match(hostname):
+                    return
+                dnsnames.append(value)
+                break
+    if not dnsnames:
+        raise ssl.CertificateError(
+            "no appropriate subjectAltName or commonName for hostname %r" % (hostname,)
+        )
+    raise ssl.CertificateError(
+        "hostname %r doesn't match %r" % (hostname, dnsnames[0] if len(dnsnames) == 1 else dnsnames)
+    )
+
+
+def _dnsname_to_pattern(dn):
+    """Convert DNS name to a regex pattern for wildcard matching."""
+    pats = []
+    for part in dn.split("."):
+        if part == "*":
+            pats.append("[^.]+")
+        else:
+            pats.append(re.escape(part))
+    return re.compile(r"\A" + r"\.".join(pats) + r"\Z", re.IGNORECASE)
+
+
+# ssl.match_hostname was removed in Python 3.12; use fallback when missing
+try:
+    match_hostname = ssl.match_hostname
+except AttributeError:
+    match_hostname = _match_hostname_fallback
 
 @backoff.on_exception(backoff.expo,
                       (pymysql.err.OperationalError),
@@ -119,10 +163,14 @@ class MySQLConnection(pymysql.connections.Connection):
                 ssl_arg["cert"] = config["ssl_cert"]
                 ssl_arg["key"] = config["ssl_key"]
 
-            # override match hostname for google cloud
+            # override match hostname for google cloud (Python <3.12 had ssl.match_hostname)
             if config.get("internal_hostname"):
                 parsed_hostname = parse_internal_hostname(config["internal_hostname"])
-                ssl.match_hostname = lambda cert, hostname: match_hostname(cert, parsed_hostname)
+                _match = match_hostname
+                try:
+                    ssl.match_hostname = lambda cert, hostname: _match(cert, parsed_hostname)
+                except AttributeError:
+                    pass
 
         super().__init__(defer_connect=True, ssl=ssl_arg, **args)
 

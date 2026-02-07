@@ -10,12 +10,15 @@ Endpoints:
 - POST /delta-check/{sourceType} - Check for changes (incremental sync)
 """
 
+import asyncio
 import os
 import sys
 import json
 import logging
 import io
 import uuid
+import subprocess
+import tempfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from contextlib import redirect_stdout, redirect_stderr
@@ -291,6 +294,130 @@ def get_tap_module(source_type: str):
         )
 
 
+def _run_mysql_collect_sync(
+    *,
+    singer_config: Dict[str, Any],
+    table_name: str,
+    schema_name: Optional[str],
+    sync_mode: str,
+    checkpoint: Dict[str, Any],
+    limit: Optional[int],
+    offset: int,
+) -> Dict[str, Any]:
+    """
+    Run MySQL collection in a sync thread so tap_mysql (and backoff) are not used in the async event loop.
+    Returns dict with keys: rows, total_rows, has_more, checkpoint.
+    """
+    import tap_mysql
+    import tap_mysql.connection as mysql_conn
+    import tap_mysql.sync_strategies.full_table as mysql_full_table
+    import tap_mysql.sync_strategies.incremental as mysql_incremental
+    import tap_mysql.sync_strategies.common as mysql_common
+    from singer import metadata
+    import singer
+
+    conn_config = {
+        "host": singer_config.get("host"),
+        "port": singer_config.get("port", 3306),
+        "user": singer_config.get("user"),
+        "password": singer_config.get("password"),
+        "database": singer_config.get("dbname"),
+    }
+    ssl_val = singer_config.get("ssl")
+    if ssl_val == "true" or (isinstance(ssl_val, dict) and ssl_val.get("enabled")):
+        conn_config["ssl"] = "true"
+    elif ssl_val == "false" or (isinstance(ssl_val, dict) and not ssl_val.get("enabled")):
+        conn_config["ssl"] = "false"
+
+    def get_conn():
+        Wrapper = mysql_conn.make_connection_wrapper(conn_config)
+        return Wrapper()
+
+    def safe_close(c):
+        try:
+            c.close()
+        except Exception:
+            pass  # tap may already close inside discover_catalog/sync_table
+
+    conn = get_conn()
+    try:
+        catalog = tap_mysql.discover_catalog(conn, conn_config)
+    finally:
+        safe_close(conn)
+
+    catalog_entry = None
+    for stream in catalog.streams:
+        md_map = metadata.to_map(stream.metadata)
+        stream_schema = md_map.get((), {}).get("database-name", conn_config.get("database"))
+        stream_table = stream.table
+        if stream_table == table_name and (not schema_name or stream_schema == schema_name):
+            catalog_entry = stream
+            break
+
+    if not catalog_entry:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Table {schema_name or 'default'}.{table_name} not found in database",
+        )
+
+    state = dict(checkpoint)
+    replication_key = metadata.to_map(catalog_entry.metadata).get((), {}).get("replication-key")
+    selected = {
+        k
+        for k in catalog_entry.schema.properties
+        if mysql_common.property_is_selected(catalog_entry, k) or k == replication_key
+    }
+    columns = tap_mysql.desired_columns(selected, catalog_entry.schema)
+
+    captured_messages = []
+    original_write_message = singer.write_message
+
+    def capture_write_message(message):
+        captured_messages.append(message)
+
+    singer.write_message = capture_write_message
+    try:
+        conn = get_conn()
+        try:
+            if sync_mode == "incremental":
+                mysql_incremental.sync_table(conn, catalog_entry, state, columns)
+            else:
+                stream_version = mysql_common.get_stream_version(catalog_entry.tap_stream_id, state)
+                mysql_full_table.sync_table(
+                    conn, catalog_entry, state, columns, stream_version
+                )
+        finally:
+            safe_close(conn)
+    finally:
+        singer.write_message = original_write_message
+
+    # Tap sends state via StateMessage; use the last one as checkpoint
+    for msg in reversed(captured_messages):
+        if type(msg).__name__ == "StateMessage" and hasattr(msg, "value"):
+            state = msg.value
+            break
+
+    records = []
+    limit_val = limit if limit is not None else float("inf")
+    record_count = 0
+    for msg in captured_messages:
+        if hasattr(msg, "record") and hasattr(msg, "stream"):
+            if record_count < offset:
+                record_count += 1
+                continue
+            if len(records) >= limit_val:
+                break
+            records.append(msg.record)
+            record_count += 1
+
+    return {
+        "rows": records,
+        "total_rows": len(records),
+        "has_more": record_count > (offset + len(records)),
+        "checkpoint": state,
+    }
+
+
 # ============================================================================
 # API Endpoints
 # ============================================================================
@@ -311,6 +438,58 @@ async def health():
     return {"status": "healthy"}
 
 
+def _mysql_catalog_to_discover_response(
+    catalog_dict: Dict[str, Any],
+    table_name: Optional[str] = None,
+    schema_name: Optional[str] = None,
+) -> DiscoverSchemaResponse:
+    """Extract columns and primary_keys for one stream from tap-mysql catalog."""
+    streams = catalog_dict.get("streams") or []
+    target = None
+    if table_name or schema_name:
+        for s in streams:
+            db = (s.get("metadata") or [])
+            root = next((m.get("metadata") or {} for m in db if m.get("breadcrumb") == []), {})
+            s_db = root.get("database-name") or s.get("database_name") or ""
+            s_tbl = s.get("table_name") or s.get("stream") or ""
+            if schema_name and s_db and schema_name.lower() != s_db.lower():
+                continue
+            if table_name and s_tbl and table_name.lower() != s_tbl.lower():
+                continue
+            target = s
+            break
+    if not target and streams:
+        target = streams[0]
+    if not target:
+        return DiscoverSchemaResponse(columns=[], primary_keys=[])
+    schema_obj = target.get("schema") or {}
+    properties = schema_obj.get("properties") or {}
+    columns = []
+    for col_name, col_schema in properties.items():
+        if isinstance(col_schema, dict):
+            col_type = col_schema.get("type", "string")
+            if isinstance(col_type, list):
+                col_type = col_type[0] if col_type else "string"
+        else:
+            col_type = "string"
+        columns.append({
+            "name": col_name,
+            "type": col_type,
+            "nullable": True,
+        })
+    primary_keys = target.get("key_properties") or []
+    row_count = None
+    for m in target.get("metadata") or []:
+        if m.get("breadcrumb") == []:
+            row_count = (m.get("metadata") or {}).get("row-count")
+            break
+    return DiscoverSchemaResponse(
+        columns=columns,
+        primary_keys=primary_keys,
+        estimated_row_count=row_count,
+    )
+
+
 @app.post("/discover-schema/{source_type}", response_model=DiscoverSchemaResponse)
 async def discover_schema(
     source_type: str,
@@ -322,10 +501,33 @@ async def discover_schema(
     """
     try:
         logger.info(f"Discovering schema for {source_type}")
-        
-        # Get tap module
+        normalized = normalize_source_type(source_type)
+
+        # MySQL: use tap subprocess (no in-process import to avoid backoff/async issues)
+        if normalized == "mysql":
+            config = request.connection_config or {}
+            mysql_config = {
+                "host": config.get("host"),
+                "port": config.get("port", 3306),
+                "user": config.get("username") or config.get("user"),
+                "password": config.get("password"),
+                "database": config.get("database"),
+            }
+            ssl_val = config.get("ssl")
+            if ssl_val == "true" or (isinstance(ssl_val, dict) and ssl_val.get("enabled")):
+                mysql_config["ssl"] = "true"
+            elif ssl_val == "false" or (isinstance(ssl_val, dict) and not ssl_val.get("enabled")):
+                mysql_config["ssl"] = "false"
+            catalog_dict = await asyncio.to_thread(_run_tap_mysql_discover, mysql_config)
+            return _mysql_catalog_to_discover_response(
+                catalog_dict,
+                table_name=request.table_name,
+                schema_name=request.schema_name,
+            )
+
+        # Get tap module (PostgreSQL, MongoDB, etc.)
         tap_module = get_tap_module(source_type)
-        
+
         # Build Singer config
         singer_config = build_singer_config(
             request.connection_config,
@@ -334,7 +536,7 @@ async def discover_schema(
             request.schema_name,
             request.query,
         )
-        
+
         # For PostgreSQL, call discovery directly
         if source_type.lower() in ['postgresql', 'postgres']:
             import tap_postgres.db as post_db
@@ -412,10 +614,10 @@ async def discover_schema(
                 raise HTTPException(status_code=500, detail=f"Discovery failed: {str(e)}")
         
         else:
-            # For MySQL and MongoDB, similar approach
+            # MongoDB and others: not yet implemented for this endpoint
             raise HTTPException(
                 status_code=501,
-                detail=f"Discovery for {source_type} not yet implemented. PostgreSQL is supported."
+                detail=f"Discovery for {source_type} not yet implemented. PostgreSQL and MySQL are supported."
             )
     
     except HTTPException:
@@ -713,101 +915,26 @@ async def collect(
                 singer.write_message = original_write_message
         
         # =====================================================
-        # MySQL - Use tap-mysql connector directly
+        # MySQL - Run tap-mysql in a thread to avoid backoff/async conflict
         # =====================================================
         elif normalized_source == 'mysql':
-            import tap_mysql
-            import tap_mysql.connection as mysql_conn
-            import tap_mysql.sync_strategies.full_table as mysql_full_table
-            import tap_mysql.sync_strategies.incremental as mysql_incremental
-            import tap_mysql.sync_strategies.common as mysql_common
-            from singer import metadata
-            import singer
-            
-            # Prepare connection config for tap-mysql
-            conn_config = {
-                'host': singer_config.get('host'),
-                'port': singer_config.get('port', 3306),
-                'user': singer_config.get('user'),
-                'password': singer_config.get('password'),
-                'database': singer_config.get('dbname'),
-            }
-            
-            if singer_config.get('ssl') == 'true':
-                conn_config['ssl'] = True
-            
             try:
-                # Use tap-mysql discovery
-                with mysql_conn.make_connection(conn_config) as conn:
-                    # Discover catalog
-                    catalog = tap_mysql.discover_catalog(conn, conn_config.get('database'))
-                
-                # Find target stream
-                target_stream = None
-                for stream in catalog.streams:
-                    stream_dict = stream.to_dict()
-                    md_map = metadata.to_map(stream_dict.get('metadata', []))
-                    stream_schema = md_map.get((), {}).get('schema-name', conn_config.get('database'))
-                    stream_table = stream_dict.get('table_name', '')
-                    
-                    if stream_table == table_name and (not schema_name or stream_schema == schema_name):
-                        target_stream = stream_dict
-                        break
-                
-                if not target_stream:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Table {schema_name}.{table_name} not found in database"
-                    )
-                
-                state = request.checkpoint or {}
-                captured_messages = []
-                
-                original_write_message = singer.write_message
-                def capture_write_message(message):
-                    captured_messages.append(message)
-                singer.write_message = capture_write_message
-                
-                try:
-                    md_map = metadata.to_map(target_stream.get('metadata', []))
-                    desired_columns = [c for c in target_stream['schema']['properties'].keys()
-                                       if mysql_common.should_sync_column(md_map, c)]
-                    
-                    if request.sync_mode == 'full':
-                        with mysql_conn.make_connection(conn_config) as conn:
-                            state = mysql_full_table.sync_table(conn, conn_config, target_stream, state, desired_columns, md_map)
-                    elif request.sync_mode == 'incremental':
-                        with mysql_conn.make_connection(conn_config) as conn:
-                            state = mysql_incremental.sync_table(conn, conn_config, target_stream, state, desired_columns, md_map)
-                    
-                    # Extract records
-                    records = []
-                    limit = request.limit or float('inf')
-                    offset = request.offset or 0
-                    record_count = 0
-                    
-                    for msg in captured_messages:
-                        if hasattr(msg, 'record') and hasattr(msg, 'stream'):
-                            if record_count < offset:
-                                record_count += 1
-                                continue
-                            if len(records) >= limit:
-                                break
-                            records.append(msg.record)
-                            record_count += 1
-                    
-                    logger.info(f"Collected {len(records)} records from {table_name}")
-                    
-                    return CollectResponse(
-                        rows=records,
-                        total_rows=len(records),
-                        has_more=record_count > (offset + len(records)),
-                        checkpoint=state,
-                    )
-                    
-                finally:
-                    singer.write_message = original_write_message
-                    
+                result = await asyncio.to_thread(
+                    _run_mysql_collect_sync,
+                    singer_config=singer_config,
+                    table_name=table_name,
+                    schema_name=schema_name,
+                    sync_mode=request.sync_mode,
+                    checkpoint=request.checkpoint or {},
+                    limit=request.limit,
+                    offset=request.offset or 0,
+                )
+                return CollectResponse(
+                    rows=result["rows"],
+                    total_rows=result["total_rows"],
+                    has_more=result["has_more"],
+                    checkpoint=result["checkpoint"],
+                )
             except HTTPException:
                 raise
             except Exception as e:
@@ -2016,85 +2143,102 @@ async def discover_postgres_schemas(config: Dict[str, Any]) -> List[Dict[str, An
     return list(schemas_map.values())
 
 
-async def discover_mysql_schemas(config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Discover schemas and tables using tap-mysql connector."""
-    try:
-        import pymysql
-    except ImportError:
+def _run_tap_mysql_discover(mysql_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Run Singer tap-mysql --discover in a subprocess and return the catalog JSON."""
+    tap_mysql_dir = os.path.join(ETL_DIR, "connectors", "tap-mysql")
+    if not os.path.isdir(tap_mysql_dir):
+        raise HTTPException(
+            status_code=500,
+            detail="tap-mysql connector not found. Ensure connectors/tap-mysql exists.",
+        )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = tap_mysql_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         try:
-            import PyMySQL as pymysql
-        except ImportError:
-            raise HTTPException(
-                status_code=500,
-                detail="MySQL driver not installed. Install with: pip install pymysql"
-            )
-    
-    from tap_mysql import discover_catalog
-    from tap_mysql.connection import connect_with_backoff, MySQLConnection
-    
-    # Build connection config for tap-mysql
-    mysql_config = {
-        'host': config.get('host'),
-        'port': config.get('port', 3306),
-        'user': config.get('username') or config.get('user'),
-        'password': config.get('password'),
-        'database': config.get('database'),
-    }
-    
-    # Create MySQL connection and use tap-mysql discovery
-    mysql_conn = MySQLConnection(mysql_config)
-    connect_with_backoff(mysql_conn)
-    
+            json.dump(mysql_config, f)
+            f.flush()
+            config_path = f.name
+        except Exception:
+            os.unlink(f.name)
+            raise
     try:
-        # Use tap-mysql discovery
-        catalog = discover_catalog(mysql_conn, mysql_config)
-        
-        # Group streams by schema (database)
-        schemas_map = {}
-        
-        for entry in catalog.streams:
-            # Extract metadata
-            from singer import metadata
-            md_map = metadata.to_map(entry.metadata)
-            root_md = md_map.get((), {})
-            
-            database_name = root_md.get('database-name', '')
-            table_name = entry.table
-            is_view = root_md.get('is-view', False)
-            row_count = root_md.get('row-count')
-            table_key_properties = root_md.get('table-key-properties', [])
-            
-            # Get columns
-            columns = []
-            for col_name, col_schema in entry.schema.properties.items():
-                col_type = col_schema.type if hasattr(col_schema, 'type') else 'string'
-                columns.append({
-                    'name': col_name,
-                    'type': col_type,
-                    'nullable': True,  # MySQL doesn't always expose this in schema
-                })
-            
-            # Initialize schema if not exists
-            if database_name not in schemas_map:
-                schemas_map[database_name] = {
-                    'name': database_name,
-                    'tables': []
-                }
-            
-            # Add table
-            schemas_map[database_name]['tables'].append({
-                'name': table_name,
-                'schema': database_name,
-                'type': 'view' if is_view else 'table',
-                'rowCount': row_count,
-                'columns': columns,
-                'primaryKeys': table_key_properties,
-            })
-        
-        return list(schemas_map.values())
+        result = subprocess.run(
+            [sys.executable, "-m", "tap_mysql", "--config", config_path, "--discover"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+            cwd=ETL_DIR,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(err or f"tap-mysql discover exited with {result.returncode}")
+        return json.loads(result.stdout)
     finally:
-        if mysql_conn:
-            mysql_conn.close()
+        try:
+            os.unlink(config_path)
+        except OSError:
+            pass
+
+
+def _catalog_streams_to_schemas(catalog_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Convert Singer catalog (streams) to our API schema list."""
+    streams = catalog_dict.get("streams") or []
+    schemas_map: Dict[str, Dict[str, Any]] = {}
+    for entry in streams:
+        meta = entry.get("metadata") or []
+        root_md = {}
+        for m in meta:
+            if m.get("breadcrumb") == []:
+                root_md = m.get("metadata") or {}
+                break
+        database_name = root_md.get("database-name") or entry.get("database_name") or ""
+        table_name = entry.get("table_name") or entry.get("stream") or ""
+        is_view = root_md.get("is-view") or entry.get("is_view") or False
+        row_count = root_md.get("row-count") or entry.get("row_count")
+        table_key_properties = entry.get("key_properties") or []
+        schema_obj = entry.get("schema") or {}
+        properties = schema_obj.get("properties") or {}
+        columns = []
+        for col_name, col_schema in properties.items():
+            if isinstance(col_schema, dict):
+                col_type = col_schema.get("type", "string")
+                if isinstance(col_type, list):
+                    col_type = col_type[0] if col_type else "string"
+            else:
+                col_type = "string"
+            columns.append({"name": col_name, "type": col_type, "nullable": True})
+        if database_name not in schemas_map:
+            schemas_map[database_name] = {"name": database_name, "tables": []}
+        schemas_map[database_name]["tables"].append({
+            "name": table_name,
+            "schema": database_name,
+            "type": "view" if is_view else "table",
+            "rowCount": row_count,
+            "columns": columns,
+            "primaryKeys": table_key_properties,
+        })
+    return list(schemas_map.values())
+
+
+async def discover_mysql_schemas(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Discover schemas and tables by running the Singer tap-mysql connector (--discover)."""
+    # Build tap-mysql config (tap expects ssl as string 'true'/'false')
+    mysql_config = {
+        "host": config.get("host"),
+        "port": config.get("port", 3306),
+        "user": config.get("username") or config.get("user"),
+        "password": config.get("password"),
+        "database": config.get("database"),
+    }
+    ssl_val = config.get("ssl")
+    if ssl_val == "true" or (isinstance(ssl_val, dict) and ssl_val.get("enabled")):
+        mysql_config["ssl"] = "true"
+    elif ssl_val == "false" or (isinstance(ssl_val, dict) and not ssl_val.get("enabled")):
+        mysql_config["ssl"] = "false"
+
+    catalog_dict = await asyncio.to_thread(_run_tap_mysql_discover, mysql_config)
+    return _catalog_streams_to_schemas(catalog_dict)
 
 
 async def discover_mongodb_schemas(config: Dict[str, Any]) -> List[Dict[str, Any]]:

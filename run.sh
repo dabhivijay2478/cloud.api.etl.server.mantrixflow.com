@@ -17,14 +17,24 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
+# Prefer .venv in this project so dependencies (e.g. pendulum for tap-mysql) are used
+if [ -f ".venv/bin/activate" ]; then
+    echo -e "${GREEN}✓ Activating .venv${NC}"
+    set +e
+    source .venv/bin/activate
+    set -e
+fi
+
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 echo -e "${BLUE}  Python ETL Service - Starting${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 echo ""
 
-# Check if Python is installed - prefer Python 3.12 or 3.11
+# Check if Python is installed - prefer venv python, then Python 3.12 or 3.11
 PYTHON_CMD="python3"
-if command -v python3.12 &> /dev/null; then
+if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "${VIRTUAL_ENV}/bin/python" ]; then
+    PYTHON_CMD="${VIRTUAL_ENV}/bin/python"
+elif command -v python3.12 &> /dev/null; then
     PYTHON_CMD="python3.12"
 elif command -v python3.11 &> /dev/null; then
     PYTHON_CMD="python3.11"
