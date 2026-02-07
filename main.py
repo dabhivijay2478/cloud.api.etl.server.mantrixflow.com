@@ -20,6 +20,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from etl_logger import activity, logger as etl_log
 from transformer import safe_exec_transform, validate_transform_script
 from utils import (
     ETLRuntimeError,
@@ -535,6 +536,9 @@ async def discover_schema(
     _token: str = Depends(_require_jwt),
 ) -> DiscoverSchemaResponse:
     normalized_source = ensure_supported_source(source_type)
+    activity("datasource.schema_discovered", f"Discovering schema for {normalized_source}", source_type=normalized_source, metadata={
+        "table_name": payload.table_name, "schema_name": payload.schema_name,
+    })
     singer_config = build_singer_config(
         normalized_source,
         payload.connection_config,
@@ -549,6 +553,9 @@ async def discover_schema(
     try:
         catalog = await asyncio.to_thread(_run_discovery_sync, normalized_source, singer_config)
         schema = extract_schema(catalog, table_name=payload.table_name, schema_name=payload.schema_name)
+        activity("datasource.schema_discovered", f"Schema discovered: {len(schema['columns'])} columns", source_type=normalized_source, metadata={
+            "column_count": len(schema["columns"]), "primary_keys": schema["primary_keys"],
+        })
         return DiscoverSchemaResponse(
             columns=schema["columns"],
             primary_keys=schema["primary_keys"],
@@ -558,9 +565,12 @@ async def discover_schema(
     except ETLRuntimeError as exc:
         mysql_auth_error = _humanize_mysql_auth_error(str(exc))
         if mysql_auth_error:
+            activity("request.error", f"Schema discovery failed: {mysql_auth_error}", level="error", source_type=normalized_source)
             raise HTTPException(status_code=400, detail=mysql_auth_error) from exc
+        activity("request.error", f"Singer discovery failed: {exc}", level="error", source_type=normalized_source)
         raise HTTPException(status_code=502, detail=f"Singer discovery failed: {exc}") from exc
     except ValueError as exc:
+        activity("request.error", f"Schema discovery validation error: {exc}", level="warn", source_type=normalized_source)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -571,6 +581,9 @@ async def collect(
     _token: str = Depends(_require_jwt),
 ) -> CollectResponse:
     normalized_source = ensure_supported_source(source_type)
+    activity("sync.collect", f"Collecting from {normalized_source}", source_type=normalized_source, metadata={
+        "sync_mode": payload.sync_mode, "table_name": payload.table_name, "limit": payload.limit, "offset": payload.offset,
+    })
     singer_config = build_singer_config(
         normalized_source,
         payload.connection_config,
@@ -616,6 +629,9 @@ async def collect(
 
     new_state = merge_state(payload.checkpoint, collect_result["state"])
 
+    activity("sync.collect", f"Collected {total_rows} rows from {normalized_source}, returning {len(page_records)}", source_type=normalized_source, metadata={
+        "total_rows": total_rows, "page_rows": len(page_records), "has_more": has_more,
+    })
     return CollectResponse(
         rows=page_records,
         total_rows=total_rows,
@@ -637,9 +653,15 @@ async def transform(
 ) -> TransformResponse:
     validation = validate_transform_script(payload.transform_script)
     if not validation.get("valid", False):
+        activity("request.error", f"Invalid transform script: {validation.get('error')}", level="warn")
         raise HTTPException(status_code=400, detail=validation.get("error", "Invalid transform script"))
 
-    result = safe_exec_transform(payload.get_records(), payload.transform_script)
+    records = payload.get_records()
+    activity("sync.transform", f"Transforming {len(records)} rows", metadata={"input_rows": len(records)})
+    result = safe_exec_transform(records, payload.transform_script)
+    activity("sync.transform", f"Transformed: {len(result['transformed_rows'])} rows, {len(result['errors'])} errors", metadata={
+        "output_rows": len(result["transformed_rows"]), "error_count": len(result["errors"]),
+    })
     return TransformResponse(
         transformed_rows=result["transformed_rows"],
         errors=result["errors"],
@@ -654,6 +676,9 @@ async def emit(
 ) -> EmitResponse:
     normalized_dest = ensure_supported_source(dest_type)
     records = payload.get_records()
+    activity("sync.emit", f"Emitting {len(records)} rows to {normalized_dest}", source_type=normalized_dest, metadata={
+        "row_count": len(records), "write_mode": payload.write_mode, "table": payload.table_name,
+    })
 
     if normalized_dest in {"postgresql", "mysql"}:
         try:
@@ -717,6 +742,7 @@ async def test_connection(
     _token: str = Depends(_require_jwt),
 ) -> TestConnectionResponse:
     source_type = ensure_supported_source(payload.type)
+    activity("datasource.connection_tested", f"Testing connection for {source_type}", source_type=source_type)
     config = payload.model_dump(exclude_none=True)
 
     if source_type == "mongodb":
