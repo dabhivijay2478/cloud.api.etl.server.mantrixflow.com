@@ -55,7 +55,10 @@ REQUIRED_CONFIG_KEYS = [
 
 LOGGER = singer.get_logger()
 
-pymysql.converters.conversions[pendulum.Pendulum] = pymysql.converters.escape_datetime
+# pendulum 2.x/3.x renamed Pendulum → DateTime; handle both for backward compatibility
+_pendulum_dt_class = getattr(pendulum, 'Pendulum', None) or getattr(pendulum, 'DateTime', None)
+if _pendulum_dt_class is not None:
+    pymysql.converters.conversions[_pendulum_dt_class] = pymysql.converters.escape_datetime
 
 
 STRING_TYPES = set([

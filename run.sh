@@ -48,7 +48,7 @@ PYTHON_VERSION=$($PYTHON_CMD --version 2>&1 | awk '{print $2}')
 echo -e "${GREEN}✓ Using Python: $PYTHON_VERSION${NC}"
 
 # Quick check if dependencies are installed
-if ! $PYTHON_CMD -c "import fastapi" &> /dev/null; then
+if ! $PYTHON_CMD -c "import fastapi, uvicorn" &> /dev/null; then
     echo -e "${YELLOW}⚠ Dependencies not found. Running setup first...${NC}"
     echo ""
     ./setup.sh
@@ -58,7 +58,9 @@ fi
 # Load environment variables
 if [ -f ".env" ]; then
     echo -e "${GREEN}✓ Loading environment variables from .env${NC}"
-    export $(cat .env | grep -v '^#' | xargs)
+    set -a
+    source .env
+    set +a
 else
     echo -e "${YELLOW}⚠ .env file not found. Using defaults.${NC}"
     echo -e "${YELLOW}   Copy .env.example to .env and configure it${NC}"
@@ -67,6 +69,7 @@ fi
 # Set defaults if not in .env
 export PORT=${PORT:-8001}
 export LOG_LEVEL=${LOG_LEVEL:-INFO}
+export RELOAD=${RELOAD:-false}
 
 echo -e "${GREEN}✓ Configuration:${NC}"
 echo -e "  - Port: $PORT"
@@ -93,4 +96,9 @@ echo -e "${YELLOW}Press Ctrl+C to stop the server${NC}"
 echo ""
 
 # Run the service
-$PYTHON_CMD main.py
+LOG_LEVEL_LOWER=$(echo "$LOG_LEVEL" | tr '[:upper:]' '[:lower:]')
+if [ "$RELOAD" = "true" ] || [ "$RELOAD" = "1" ]; then
+    exec $PYTHON_CMD -m uvicorn main:app --host 0.0.0.0 --port "$PORT" --log-level "$LOG_LEVEL_LOWER" --reload
+else
+    exec $PYTHON_CMD -m uvicorn main:app --host 0.0.0.0 --port "$PORT" --log-level "$LOG_LEVEL_LOWER"
+fi

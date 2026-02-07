@@ -1,252 +1,177 @@
-"""
-Transformer Module
-Safely executes user-provided Python transform scripts on records.
+"""Safe transformation runtime for user-provided Python scripts."""
 
-The transform script must define a function:
-    def transform(record):
-        # Use record.get("source_field") to read from source
-        # Return dict with destination keys
-        return {"destination_field": record.get("source_field")}
-"""
+from __future__ import annotations
 
+import ast
 import json
-import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Tuple
 
-logger = logging.getLogger(__name__)
 
-# Restricted globals for safe execution
-# Use a copy of builtins to allow import statements
-import builtins
+def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):  # noqa: A002
+    """Allow imports only for the json module."""
+    if level != 0:
+        raise ImportError("Relative imports are not allowed")
+    if name == "json":
+        return json
+    raise ImportError(f"Only json imports are allowed (got: {name})")
 
-# Create a safe builtins dict that allows common operations and imports
+
 SAFE_BUILTINS = {
-    # Safe builtins
-    'abs': abs,
-    'all': all,
-    'any': any,
-    'bool': bool,
-    'dict': dict,
-    'float': float,
-    'int': int,
-    'len': len,
-    'list': list,
-    'max': max,
-    'min': min,
-    'range': range,
-    'round': round,
-    'str': str,
-    'sum': sum,
-    'tuple': tuple,
-    'type': type,
-    'zip': zip,
-    'map': map,
-    'filter': filter,
-    'sorted': sorted,
-    'reversed': reversed,
-    'enumerate': enumerate,
-    'set': set,
-    'frozenset': frozenset,
-    'bytes': bytes,
-    'bytearray': bytearray,
-    'ord': ord,
-    'chr': chr,
-    'hex': hex,
-    'oct': oct,
-    'bin': bin,
-    'format': format,
-    'repr': repr,
-    'hash': hash,
-    'id': id,
-    'callable': callable,
-    'print': print,  # Allow print for debugging
-    # Type checking
-    'isinstance': isinstance,
-    'issubclass': issubclass,
-    'hasattr': hasattr,
-    'getattr': getattr,
-    'setattr': setattr,
-    'delattr': delattr,
-    # CRITICAL: Allow __import__ for import statements
-    '__import__': __import__,
-    # Exceptions
-    'ValueError': ValueError,
-    'TypeError': TypeError,
-    'KeyError': KeyError,
-    'AttributeError': AttributeError,
-    'IndexError': IndexError,
-    'Exception': Exception,
-    'RuntimeError': RuntimeError,
-    # Constants
-    'None': None,
-    'True': True,
-    'False': False,
-    # String formatting
-    '__name__': '__main__',
+    "abs": abs,
+    "all": all,
+    "any": any,
+    "bool": bool,
+    "dict": dict,
+    "enumerate": enumerate,
+    "filter": filter,
+    "float": float,
+    "int": int,
+    "isinstance": isinstance,
+    "len": len,
+    "list": list,
+    "map": map,
+    "max": max,
+    "min": min,
+    "range": range,
+    "round": round,
+    "set": set,
+    "sorted": sorted,
+    "str": str,
+    "sum": sum,
+    "tuple": tuple,
+    "zip": zip,
+    "Exception": Exception,
+    "ValueError": ValueError,
+    "TypeError": TypeError,
+    "KeyError": KeyError,
+    "__import__": _safe_import,
 }
 
-# Pre-import safe modules that scripts might use
-import datetime
-import re
-import math
+FORBIDDEN_NODES: Tuple[type[ast.AST], ...] = (
+    ast.Global,
+    ast.Nonlocal,
+    ast.With,
+    ast.AsyncWith,
+    ast.Try,
+    ast.Raise,
+    ast.ClassDef,
+    ast.Lambda,
+)
 
-RESTRICTED_GLOBALS = {
-    '__builtins__': SAFE_BUILTINS,
-    # Pre-imported modules for convenience
-    'json': json,
-    'datetime': datetime,
-    're': re,
-    'math': math,
+FORBIDDEN_NAMES = {
+    "__import__",
+    "open",
+    "exec",
+    "eval",
+    "compile",
+    "globals",
+    "locals",
+    "vars",
+    "input",
+    "help",
+    "dir",
+    "breakpoint",
+    "memoryview",
 }
 
 
-def safe_exec_transform(
-    records: List[Dict[str, Any]],
-    transform_script: str,
-) -> Dict[str, Any]:
-    """
-    Safely execute a user-provided transform script on each record.
-    
-    Args:
-        records: List of source records to transform
-        transform_script: Python code
-            that defines a `transform(record)` function
-            
-    Returns:
-        Dict with:
-            - transformed_rows: List of transformed records
-            - errors: List of error dicts for failed transformations
-            
-    The transform script should:
-        - Define a function: def transform(record):
-        - Use record.get("source_field") to read from source
-        - Return a dict with destination keys
-    """
-    if not transform_script or not transform_script.strip():
-        logger.warning("Empty transform script provided, returning records as-is")
-        return {
-            'transformed_rows': records,
-            'errors': [],
-        }
-    
-    # Prepare the execution environment
-    exec_globals = RESTRICTED_GLOBALS.copy()
-    exec_locals = {}
-    
-    try:
-        # Execute the transform script to define the transform function
-        exec(transform_script, exec_globals, exec_locals)
-    except Exception as e:
-        error_msg = f"Failed to compile transform script: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        return {
-            'transformed_rows': [],
-            'errors': [{
-                'record_index': -1,
-                'error': error_msg,
-                'type': 'compilation_error',
-            }],
-        }
-    
-    # Get the transform function
-    transform_func = exec_locals.get('transform')
-    if not transform_func or not callable(transform_func):
-        error_msg = "Transform script must define a function named 'transform(record)'"
-        logger.error(error_msg)
-        return {
-            'transformed_rows': [],
-            'errors': [{
-                'record_index': -1,
-                'error': error_msg,
-                'type': 'missing_transform_function',
-            }],
-        }
-    
-    # Transform each record
-    transformed_rows = []
-    errors = []
-    
-    for idx, record in enumerate(records):
-        try:
-            # Prepare locals for each record execution
-            record_locals = {
-                'record': record,
-                'json': json,
-            }
-            
-            # Execute transform function
-            transformed_record = transform_func(record)
-            
-            # Validate result
-            if not isinstance(transformed_record, dict):
-                raise TypeError(f"Transform function must return a dict, got {type(transformed_record)}")
-            
-            transformed_rows.append(transformed_record)
-            
-        except Exception as e:
-            error_msg = f"Transform failed for record {idx}: {str(e)}"
-            logger.warning(error_msg, exc_info=True)
-            errors.append({
-                'record_index': idx,
-                'error': error_msg,
-                'type': type(e).__name__,
-                'record_preview': str(record)[:200] if record else None,
-            })
-    
-    logger.info(f"Transformed {len(transformed_rows)}/{len(records)} records successfully")
-    
-    return {
-        'transformed_rows': transformed_rows,
-        'errors': errors,
-    }
+def _validate_ast(script: str) -> None:
+    tree = ast.parse(script, mode="exec")
+
+    has_transform = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name != "json":
+                    raise ValueError("Only `import json` is allowed")
+            continue
+
+        if isinstance(node, ast.ImportFrom):
+            if node.module != "json" or node.level != 0:
+                raise ValueError("Only imports from `json` are allowed")
+            if any(alias.name == "*" for alias in node.names):
+                raise ValueError("Wildcard imports are not allowed")
+            continue
+
+        if isinstance(node, FORBIDDEN_NODES):
+            raise ValueError(f"Forbidden syntax detected: {node.__class__.__name__}")
+        if isinstance(node, ast.Name) and node.id in FORBIDDEN_NAMES:
+            raise ValueError(f"Forbidden name usage: {node.id}")
+        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+            raise ValueError("Dunder attribute access is not allowed")
+
+        if isinstance(node, ast.FunctionDef) and node.name == "transform":
+            has_transform = True
+            if len(node.args.args) != 1:
+                raise ValueError("transform(record) must accept exactly one argument")
+
+    if not has_transform:
+        raise ValueError("Transform script must define `def transform(record): ...`")
+
+
+def _compile_transform(script: str):
+    _validate_ast(script)
+    compiled = compile(script, "<transform_script>", "exec")
+    global_scope = {"__builtins__": SAFE_BUILTINS, "json": json}
+    local_scope: Dict[str, Any] = {}
+    exec(compiled, global_scope, local_scope)
+    transform_fn = local_scope.get("transform")
+    if not callable(transform_fn):
+        raise ValueError("Transform script must define callable `transform(record)`")
+    return transform_fn
 
 
 def validate_transform_script(transform_script: str) -> Dict[str, Any]:
-    """
-    Validate a transform script without executing it on data.
-    
-    Returns:
-        Dict with 'valid' (bool) and 'error' (str, optional)
-    """
     if not transform_script or not transform_script.strip():
-        return {
-            'valid': False,
-            'error': 'Transform script is empty',
-        }
-    
-    exec_globals = RESTRICTED_GLOBALS.copy()
-    exec_locals = {}
-    
+        return {"valid": False, "error": "Transform script is empty"}
+
     try:
-        exec(transform_script, exec_globals, exec_locals)
-    except Exception as e:
-        return {
-            'valid': False,
-            'error': f"Compilation error: {str(e)}",
-        }
-    
-    transform_func = exec_locals.get('transform')
-    if not transform_func or not callable(transform_func):
-        return {
-            'valid': False,
-            'error': "Transform script must define a function named 'transform(record)'",
-        }
-    
-    # Test with a sample record
+        transform_fn = _compile_transform(transform_script)
+        test_record = {"sample": 1}
+        test_result = transform_fn(test_record)
+        if not isinstance(test_result, dict):
+            return {"valid": False, "error": "transform(record) must return a dict"}
+        return {"valid": True}
+    except Exception as exc:  # pragma: no cover - explicit error transport
+        return {"valid": False, "error": str(exc)}
+
+
+def safe_exec_transform(records: List[Dict[str, Any]], transform_script: str) -> Dict[str, Any]:
+    if not transform_script or not transform_script.strip():
+        return {"transformed_rows": records, "errors": []}
+
     try:
-        test_record = {'test_field': 'test_value'}
-        result = transform_func(test_record)
-        if not isinstance(result, dict):
-            return {
-                'valid': False,
-                'error': f"Transform function must return a dict, got {type(result)}",
-            }
-    except Exception as e:
+        transform_fn = _compile_transform(transform_script)
+    except Exception as exc:
         return {
-            'valid': False,
-            'error': f"Transform function test failed: {str(e)}",
+            "transformed_rows": [],
+            "errors": [
+                {
+                    "record_index": -1,
+                    "error": f"Invalid transform script: {exc}",
+                    "type": "script_validation_error",
+                }
+            ],
         }
-    
-    return {
-        'valid': True,
-    }
+
+    transformed_rows: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+
+    for idx, record in enumerate(records):
+        try:
+            # Controlled local scope for per-record transform context.
+            local_scope = {"record": record, "json": json}
+            result = transform_fn(local_scope["record"])
+            if not isinstance(result, dict):
+                raise TypeError(f"transform(record) must return dict, got {type(result).__name__}")
+            transformed_rows.append(result)
+        except Exception as exc:
+            errors.append(
+                {
+                    "record_index": idx,
+                    "error": str(exc),
+                    "type": exc.__class__.__name__,
+                }
+            )
+
+    return {"transformed_rows": transformed_rows, "errors": errors}

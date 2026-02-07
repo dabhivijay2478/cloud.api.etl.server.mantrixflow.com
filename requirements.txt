@@ -1,40 +1,20 @@
-# FastAPI and server
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-python-multipart==0.0.6
-
-# Data processing
-pydantic==2.5.0
-polars==0.19.19
-sqlalchemy==2.0.23
-
-# Database drivers
-# Note: psycopg2-binary 2.9.9 doesn't fully support Python 3.13
-# Latest available version is 2.9.11
-# For Python 3.13, consider using Python 3.11 or 3.12 for better compatibility
-# Or wait for psycopg2-binary to add Python 3.13 support
+fastapi==0.128.0
+uvicorn[standard]==0.35.0
+pydantic==2.11.7
+polars==1.33.1
+sqlalchemy==2.0.43
 psycopg2-binary==2.9.11
-pymongo==4.10.1
-pymysql==1.1.1  # MySQL driver
-
-# Environment
-python-dotenv==1.0.0
-
-# Singer taps (local connectors)
-# Note: These are installed from local connectors/ directories
-# Install with: pip install -e connectors/tap-postgres
-#               pip install -e connectors/tap-mysql
-#               pip install -e connectors/tap-mongodb
-
-# Singer core
+pymongo==4.15.0
+pymysql==1.1.2
+python-dotenv==1.1.1
 singer-python==6.3.0
-
-# Utilities
-python-jose[cryptography]==3.3.0  # For JWT validation
-python-dateutil==2.8.2
-pendulum>=2.1.0,<4.0.0  # Required by tap-mysql (Singer) for date/time handling
-backports.ssl_match_hostname>=3.7.0  # Python 3.12+ compatibility (ssl.match_hostname was removed)
-setuptools>=60.0.0  # Provides distutils on Python 3.12+ (required by pymysqlreplication / tap-mysql)
-
-# Serverless/ASGI adapter for Vercel (@vercel/python builder)
-mangum==0.17.0  # Required for FastAPI on Vercel with @vercel/python builder
+python-multipart==0.0.20
+pytest==8.4.2
+# Dependencies required by Singer tap connectors
+pendulum>=2.1.2
+backoff>=1.8.0
+mysql-replication>=0.24
+strict-rfc3339>=0.7
+tzlocal>=2.0.0
+attrs>=16.3.0
+setuptools
