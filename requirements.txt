@@ -5,6 +5,7 @@ polars==1.33.1
 sqlalchemy==2.0.43
 psycopg2-binary==2.9.11
 pymongo==4.15.0
+certifi
 pymysql==1.1.2
 python-dotenv==1.1.1
 singer-python==6.3.0

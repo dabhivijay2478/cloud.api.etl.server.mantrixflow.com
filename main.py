@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
+import certifi
 from pymongo import MongoClient
 from pymongo import UpdateOne
 from sqlalchemy import JSON, BigInteger, Boolean, Column, Float, MetaData, Table, Text, create_engine
@@ -481,7 +482,7 @@ def _emit_to_mongodb(
     if not database_name:
         raise ValueError("MongoDB database is required")
 
-    client = MongoClient(connection_uri)
+    client = MongoClient(connection_uri, tlsCAFile=certifi.where())
     collection = client[database_name][table_name]
     rows_written = 0
     rows_failed = 0
@@ -767,7 +768,7 @@ async def test_connection(
             else:
                 uri = f"mongodb://{host}:{port}/{db_name}"
         try:
-            client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+            client = MongoClient(uri, serverSelectionTimeoutMS=5000, tlsCAFile=certifi.where())
             client.admin.command("ping")
             client.close()
             return TestConnectionResponse(success=True, message="MongoDB connection successful")
