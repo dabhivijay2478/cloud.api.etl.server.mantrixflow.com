@@ -17,14 +17,24 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
+# Prefer .venv in this project so dependencies (e.g. pendulum for tap-mysql) are used
+if [ -f ".venv/bin/activate" ]; then
+    echo -e "${GREEN}✓ Activating .venv${NC}"
+    set +e
+    source .venv/bin/activate
+    set -e
+fi
+
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 echo -e "${BLUE}  Python ETL Service - Starting${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 echo ""
 
-# Check if Python is installed - prefer Python 3.12 or 3.11
+# Check if Python is installed - prefer venv python, then Python 3.12 or 3.11
 PYTHON_CMD="python3"
-if command -v python3.12 &> /dev/null; then
+if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "${VIRTUAL_ENV}/bin/python" ]; then
+    PYTHON_CMD="${VIRTUAL_ENV}/bin/python"
+elif command -v python3.12 &> /dev/null; then
     PYTHON_CMD="python3.12"
 elif command -v python3.11 &> /dev/null; then
     PYTHON_CMD="python3.11"
@@ -38,7 +48,7 @@ PYTHON_VERSION=$($PYTHON_CMD --version 2>&1 | awk '{print $2}')
 echo -e "${GREEN}✓ Using Python: $PYTHON_VERSION${NC}"
 
 # Quick check if dependencies are installed
-if ! $PYTHON_CMD -c "import fastapi" &> /dev/null; then
+if ! $PYTHON_CMD -c "import fastapi, uvicorn" &> /dev/null; then
     echo -e "${YELLOW}⚠ Dependencies not found. Running setup first...${NC}"
     echo ""
     ./setup.sh
@@ -48,7 +58,9 @@ fi
 # Load environment variables
 if [ -f ".env" ]; then
     echo -e "${GREEN}✓ Loading environment variables from .env${NC}"
-    export $(cat .env | grep -v '^#' | xargs)
+    set -a
+    source .env
+    set +a
 else
     echo -e "${YELLOW}⚠ .env file not found. Using defaults.${NC}"
     echo -e "${YELLOW}   Copy .env.example to .env and configure it${NC}"
@@ -57,6 +69,7 @@ fi
 # Set defaults if not in .env
 export PORT=${PORT:-8001}
 export LOG_LEVEL=${LOG_LEVEL:-INFO}
+export RELOAD=${RELOAD:-false}
 
 echo -e "${GREEN}✓ Configuration:${NC}"
 echo -e "  - Port: $PORT"
@@ -83,4 +96,9 @@ echo -e "${YELLOW}Press Ctrl+C to stop the server${NC}"
 echo ""
 
 # Run the service
-$PYTHON_CMD main.py
+LOG_LEVEL_LOWER=$(echo "$LOG_LEVEL" | tr '[:upper:]' '[:lower:]')
+if [ "$RELOAD" = "true" ] || [ "$RELOAD" = "1" ]; then
+    exec $PYTHON_CMD -m uvicorn main:app --host 0.0.0.0 --port "$PORT" --log-level "$LOG_LEVEL_LOWER" --reload
+else
+    exec $PYTHON_CMD -m uvicorn main:app --host 0.0.0.0 --port "$PORT" --log-level "$LOG_LEVEL_LOWER"
+fi

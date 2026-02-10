@@ -43,12 +43,33 @@ PYTHON_MINOR=$(echo $PYTHON_VERSION | cut -d. -f2)
 
 echo -e "${GREEN}✓ Using Python version: $PYTHON_VERSION${NC}"
 
-# Warn about Python 3.13 compatibility
+# Require Python 3.11 or 3.12 (3.13 breaks pydantic-core build and many wheels)
 if [ "$PYTHON_MAJOR" = "3" ] && [ "$PYTHON_MINOR" = "13" ]; then
-    echo -e "${YELLOW}⚠ Warning: Python 3.13 may have compatibility issues${NC}"
-    echo -e "${YELLOW}   Consider installing Python 3.12: brew install python@3.12${NC}"
-    echo -e "${YELLOW}   See INSTALL_PYTHON312.md for instructions${NC}"
-    echo ""
+    echo -e "${RED}❌ Python 3.13 is not supported (pydantic-core and other deps lack wheels).${NC}"
+    echo -e "${YELLOW}   Use Python 3.12: brew install python@3.12, then run this script again.${NC}"
+    exit 1
+fi
+
+# Create or fix .venv: use Python 3.11/3.12 only (run.sh will use this venv)
+if [ -f ".venv/bin/python" ]; then
+    VENV_VER=$(.venv/bin/python --version 2>&1 | awk '{print $2}')
+    VENV_MINOR=$(echo "$VENV_VER" | cut -d. -f2)
+    if [ "$VENV_MINOR" = "13" ]; then
+        echo -e "${YELLOW}⚠ Removing existing .venv (Python 3.13) and recreating with Python $PYTHON_VERSION${NC}"
+        rm -rf .venv
+    fi
+fi
+if [ ! -f ".venv/bin/activate" ]; then
+    echo -e "${BLUE}Creating .venv with $PYTHON_CMD...${NC}"
+    $PYTHON_CMD -m venv .venv
+    echo -e "${GREEN}✓ .venv created${NC}"
+fi
+if [ -f ".venv/bin/activate" ]; then
+    echo -e "${GREEN}✓ Activating .venv for installs${NC}"
+    set +e
+    source .venv/bin/activate
+    set -e
+    PYTHON_CMD=".venv/bin/python"
 fi
 
 # Check if uv is installed
@@ -69,16 +90,22 @@ fi
 echo -e "${GREEN}✓ uv version: $(uv --version)${NC}"
 echo ""
 
-# Step 1: Install Python dependencies
+# Step 1: Install Python dependencies (into .venv when present)
 echo -e "${BLUE}Step 1: Installing Python dependencies...${NC}"
-if uv pip install -r requirements.txt; then
+if [ -n "${VIRTUAL_ENV:-}" ] || [ -f ".venv/bin/python" ]; then
+    PIP_CMD="${PYTHON_CMD} -m pip"
+    if ! $PYTHON_CMD -m pip --version &> /dev/null; then
+        $PYTHON_CMD -m ensurepip --upgrade 2>/dev/null || true
+    fi
+    $PIP_CMD install --upgrade pip
+    $PIP_CMD install -r requirements.txt
+    echo -e "${GREEN}✓ Dependencies installed into .venv (includes pendulum for tap-mysql)${NC}"
+elif uv pip install -r requirements.txt 2>/dev/null; then
     echo -e "${GREEN}✓ Dependencies installed with uv${NC}"
 else
-    echo -e "${YELLOW}⚠ Installation with uv failed. Trying with pip...${NC}"
-    # Ensure pip is available
+    echo -e "${YELLOW}⚠ Trying pip...${NC}"
     if ! $PYTHON_CMD -m pip --version &> /dev/null; then
-        echo -e "${YELLOW}📦 Installing pip...${NC}"
-        $PYTHON_CMD -m ensurepip --upgrade || curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py && $PYTHON_CMD get-pip.py && rm get-pip.py
+        $PYTHON_CMD -m ensurepip --upgrade 2>/dev/null || true
     fi
     $PYTHON_CMD -m pip install --upgrade pip
     $PYTHON_CMD -m pip install -r requirements.txt
@@ -119,14 +146,15 @@ fi
 
 if [ -d "connectors/tap-mysql" ]; then
     if ! $PYTHON_CMD -c "import tap_mysql" &> /dev/null; then
-        echo -e "${YELLOW}📦 Installing tap-mysql...${NC}"
-        if uv pip install -e connectors/tap-mysql; then
-            echo -e "${GREEN}✓ tap-mysql installed${NC}"
-        else
-            echo -e "${YELLOW}⚠ uv failed, trying pip...${NC}"
+        echo -e "${YELLOW}📦 Installing tap-mysql (requires pendulum from requirements.txt)...${NC}"
+        if [ -n "${VIRTUAL_ENV:-}" ] || [ -f ".venv/bin/python" ]; then
             $PYTHON_CMD -m pip install -e connectors/tap-mysql
-            echo -e "${GREEN}✓ tap-mysql installed${NC}"
+        elif uv pip install -e connectors/tap-mysql; then
+            true
+        else
+            $PYTHON_CMD -m pip install -e connectors/tap-mysql
         fi
+        echo -e "${GREEN}✓ tap-mysql installed${NC}"
     else
         echo -e "${GREEN}✓ tap-mysql already installed${NC}"
     fi

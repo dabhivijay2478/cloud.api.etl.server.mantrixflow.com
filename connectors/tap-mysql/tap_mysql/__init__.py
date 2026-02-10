@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # pylint: disable=missing-docstring,not-an-iterable,too-many-locals,too-many-arguments,too-many-branches,invalid-name,duplicate-code,too-many-statements
 
+# Ensure distutils is available on Python 3.12+ (pymysqlreplication uses distutils.version)
+try:
+    import setuptools  # noqa: F401
+except ImportError:
+    pass
+
 import datetime
 import collections
 import itertools
@@ -49,7 +55,10 @@ REQUIRED_CONFIG_KEYS = [
 
 LOGGER = singer.get_logger()
 
-pymysql.converters.conversions[pendulum.Pendulum] = pymysql.converters.escape_datetime
+# pendulum 2.x/3.x renamed Pendulum → DateTime; handle both for backward compatibility
+_pendulum_dt_class = getattr(pendulum, 'Pendulum', None) or getattr(pendulum, 'DateTime', None)
+if _pendulum_dt_class is not None:
+    pymysql.converters.conversions[_pendulum_dt_class] = pymysql.converters.escape_datetime
 
 
 STRING_TYPES = set([
