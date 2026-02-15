@@ -342,6 +342,15 @@ For **postgres-to-mongodb**, use `POST /run-meltano-pipeline` (dynamic mode).
 
 To avoid infinite loops when both directions run, use a `transform_script` that adds `_last_modified_by` so each side can filter out records it didn't originate.
 
+### PostgreSQL Incremental Sync (LOG_BASED)
+
+For PostgreSQL sources, incremental sync uses **LOG_BASED** replication (transaction logs via wal2json) instead of replication keys. Requirements (no data is modified in your database by this app):
+
+- **Logical replication enabled** on the source (e.g. Neon: Settings → Beta → Enable logical replication; see [Neon wal2json docs](https://neon.com/docs/extensions/wal2json))
+- **Replication slot** `stitch_{dbname}` created by you in your database: `SELECT * FROM pg_create_logical_replication_slot('stitch_yourdb', 'wal2json');`
+
+If logical replication is not enabled or the slot is missing, the pipeline will fail with a clear error message in the UI explaining what to do.
+
 ---
 
 ## Architecture
