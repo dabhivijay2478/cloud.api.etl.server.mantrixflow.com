@@ -1,0 +1,62 @@
+# Meltano Project: Postgres ↔ MongoDB Sync
+# https://docs.meltano.com/concepts/project
+#
+# DYNAMIC MODE (recommended; connections from database at pipeline run time):
+#   Use the ETL API: POST /run-meltano-pipeline
+#   Supports both postgres-to-mongodb and mongodb-to-postgres. No Meltano install needed.
+#
+# STATIC MODE (CLI/cron, mongodb-to-postgres only):
+#   target-mongodb (hotglue) fails on Python 3.12 (pendulum/distutils). Use dynamic API for
+#   postgres-to-mongodb. For mongodb-to-postgres via Meltano CLI:
+#   Set POSTGRES_URL, MONGODB_URI, MONGODB_DATABASE in .env
+#   Run: meltano install && meltano run mongodb-to-postgres
+
+project_id: ai-bi-etl
+
+plugins:
+  extractors:
+    - name: tap-postgres
+      variant: meltanolabs
+      config:
+        sqlalchemy_url: ${POSTGRES_URL}
+        default_replication_method: INCREMENTAL
+        filter_schemas: ["public"]
+      select:
+        - "*.*"
+
+    - name: tap-mongodb
+      variant: meltanolabs
+      config:
+        mongodb_connection_string: ${MONGODB_URI}
+        database: ${MONGODB_DATABASE}
+        flattening_enabled: true
+        flattening_max_depth: 5
+      metadata:
+        "*":
+          replication-method: INCREMENTAL
+          replication-key: _id
+
+  loaders:
+    - name: target-postgres
+      variant: meltanolabs
+      config:
+        sqlalchemy_url: ${POSTGRES_URL}
+        load_method: upsert
+        add_record_metadata: true
+        flattening_enabled: true
+        flattening_max_depth: 5
+
+# target-mongodb (hotglue) removed: fails on Python 3.12 due to pendulum/distutils.
+# For postgres-to-mongodb use: POST /run-meltano-pipeline (dynamic mode).
+
+jobs:
+  - name: mongodb-to-postgres
+    tasks:
+      - tap-mongodb
+      - target-postgres
+
+schedules:
+  - name: mongodb-to-postgres-hourly
+    job: mongodb-to-postgres
+    interval: "@hourly"
+    start_date: 2025-01-01 00:00:00

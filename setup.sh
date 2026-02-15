@@ -113,15 +113,14 @@ else
 fi
 echo ""
 
-# Step 2: Verify tap-postgres setup is correct
-echo -e "${BLUE}Step 2: Verifying tap-postgres dependencies...${NC}"
+# Step 2: Verify tap-postgres and tap-mongodb setup
+echo -e "${BLUE}Step 2: Verifying tap dependencies...${NC}"
 TAP_POSTGRES_SETUP="$SCRIPT_DIR/connectors/tap-postgres/setup.py"
 if [ -f "$TAP_POSTGRES_SETUP" ]; then
     if grep -q "psycopg2-binary" "$TAP_POSTGRES_SETUP"; then
         echo -e "${GREEN}✓ tap-postgres uses psycopg2-binary (correct)${NC}"
     else
         echo -e "${YELLOW}⚠ tap-postgres still uses psycopg2 (will be updated)${NC}"
-        echo -e "${YELLOW}   The setup.py has been updated to use psycopg2-binary${NC}"
     fi
 fi
 echo ""
@@ -174,8 +173,31 @@ if [ -d "connectors/tap-mongodb" ]; then
         echo -e "${GREEN}✓ tap-mongodb already installed${NC}"
     fi
 fi
-
 echo ""
+
+# Step 4: Optional Meltano (for static CLI/cron mode)
+# Skip with: SKIP_MELTANO=1 ./setup.sh
+echo -e "${BLUE}Step 4: Meltano (optional, for CLI/cron runs)...${NC}"
+if [ "${SKIP_MELTANO:-0}" = "1" ]; then
+    echo -e "${YELLOW}  Skipping Meltano (SKIP_MELTANO=1). Dynamic mode works without it.${NC}"
+elif [ -f "meltano.yml" ]; then
+    if command -v meltano &> /dev/null; then
+        echo -e "${YELLOW}📦 Installing Meltano plugins (tap-postgres, tap-mongodb, target-postgres)...${NC}"
+        echo -e "${YELLOW}   This may take 2–5 minutes on first run.${NC}"
+        if meltano install; then
+            echo -e "${GREEN}✓ Meltano plugins installed${NC}"
+        else
+            echo -e "${YELLOW}⚠ Meltano install had issues. Run 'meltano install' manually, or skip with SKIP_MELTANO=1 ./setup.sh${NC}"
+        fi
+    else
+        echo -e "${YELLOW}  Meltano not found. For static CLI mode, install with: pipx install meltano${NC}"
+        echo -e "${YELLOW}  Dynamic mode (POST /run-meltano-pipeline) works without Meltano.${NC}"
+    fi
+else
+    echo -e "${GREEN}✓ meltano.yml not present, skipping Meltano${NC}"
+fi
+echo ""
+
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 echo -e "${GREEN}✅ Setup completed successfully!${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
@@ -183,4 +205,5 @@ echo ""
 echo -e "${GREEN}Next steps:${NC}"
 echo -e "  1. Configure your .env file (copy from .env.example if needed)"
 echo -e "  2. Run ./run.sh to start the ETL service"
+echo -e "  3. For Meltano CLI: copy .env.meltano.example to .env and set POSTGRES_URL, MONGODB_URI"
 echo ""

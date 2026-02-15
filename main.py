@@ -191,6 +191,33 @@ class TestConnectionRequest(BaseModel):
     tls: Optional[bool] = None
 
 
+class RunMeltanoPipelineRequest(BaseModel):
+    """Dynamic Meltano-style pipeline. Connections come from DB (passed by API at run time)."""
+    direction: Literal["postgres-to-mongodb", "mongodb-to-postgres"]
+    source_connection_config: Dict[str, Any]
+    dest_connection_config: Dict[str, Any]
+    source_table: Optional[str] = None
+    source_schema: Optional[str] = "public"
+    dest_table: Optional[str] = None
+    dest_schema: Optional[str] = "public"
+    sync_mode: Literal["full", "incremental"] = "full"
+    write_mode: Literal["append", "upsert", "replace"] = "upsert"
+    upsert_key: Optional[List[str]] = None
+    transform_script: Optional[str] = None
+    checkpoint: Optional[Dict[str, Any]] = None
+    limit: Optional[int] = None
+    replication_key: Optional[str] = None
+
+
+class RunMeltanoPipelineResponse(BaseModel):
+    rows_read: int
+    rows_written: int
+    rows_skipped: int
+    rows_failed: int
+    checkpoint: Dict[str, Any] = Field(default_factory=dict)
+    errors: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 class TestConnectionResponse(BaseModel):
     success: bool
     message: Optional[str] = None
@@ -836,6 +863,127 @@ async def emit(
             raise HTTPException(status_code=500, detail=f"Emit failed: {exc}") from exc
 
     raise HTTPException(status_code=400, detail=f"Unsupported destination type: {dest_type}")
+
+
+@app.post("/run-meltano-pipeline", response_model=RunMeltanoPipelineResponse)
+async def run_meltano_pipeline(
+    payload: RunMeltanoPipelineRequest,
+    _token: str = Depends(_require_jwt),
+) -> RunMeltanoPipelineResponse:
+    """
+    Run a Meltano-style pipeline with **dynamic connections** from the database.
+    The API fetches source and dest connection configs from data_source_connections
+    and passes them here. Supports postgres-to-mongodb and mongodb-to-postgres.
+    """
+    direction = payload.direction
+    if direction == "postgres-to-mongodb":
+        source_type = "postgresql"
+        dest_type = "mongodb"
+    else:
+        source_type = "mongodb"
+        dest_type = "postgresql"
+
+    dest_table = payload.dest_table or payload.source_table
+    if not dest_table:
+        raise HTTPException(status_code=400, detail="source_table or dest_table is required")
+
+    activity(
+        "sync.meltano_pipeline",
+        f"Running {direction}: collect from {source_type} -> emit to {dest_type}",
+        source_type=source_type,
+        metadata={"source_table": payload.source_table, "dest_table": dest_table},
+    )
+
+    singer_config = build_singer_config(
+        source_type,
+        payload.source_connection_config,
+        {
+            "table": payload.source_table,
+            "schema": payload.source_schema,
+        },
+    )
+
+    try:
+        discovery_catalog = await asyncio.to_thread(_run_discovery_sync, source_type, singer_config)
+        selected_catalog, _ = select_catalog_streams(
+            source_type,
+            discovery_catalog,
+            table_name=payload.source_table,
+            schema_name=payload.source_schema,
+            sync_mode=payload.sync_mode,
+            replication_key=payload.replication_key,
+        )
+        collect_result = await asyncio.to_thread(
+            _run_collect_sync,
+            source_type,
+            singer_config,
+            selected_catalog,
+            payload.checkpoint,
+        )
+    except ETLRuntimeError as exc:
+        activity("request.error", f"Meltano pipeline collect failed: {exc}", level="error", source_type=source_type)
+        raise HTTPException(status_code=502, detail=f"Collection failed: {exc}") from exc
+
+    records = collect_result["records"]
+    if payload.limit:
+        records = records[: payload.limit]
+
+    rows_read = len(records)
+    if rows_read == 0:
+        return RunMeltanoPipelineResponse(
+            rows_read=0,
+            rows_written=0,
+            rows_skipped=0,
+            rows_failed=0,
+            checkpoint=merge_state(payload.checkpoint, collect_result["state"]),
+        )
+
+    if payload.transform_script:
+        validation = validate_transform_script(payload.transform_script)
+        if not validation.get("valid", False):
+            raise HTTPException(status_code=400, detail=validation.get("error", "Invalid transform script"))
+        transform_result = safe_exec_transform(records, payload.transform_script)
+        records = transform_result["transformed_rows"]
+
+    upsert_keys = payload.upsert_key or []
+    try:
+        if dest_type == "mongodb":
+            emit_result = _emit_to_mongodb(
+                payload.dest_connection_config,
+                dest_table,
+                payload.write_mode,
+                upsert_keys,
+                records,
+            )
+        else:
+            emit_result = _emit_to_sql(
+                dest_type,
+                payload.dest_connection_config,
+                dest_table,
+                payload.dest_schema,
+                payload.write_mode,
+                upsert_keys,
+                records,
+            )
+    except (ValueError, Exception) as exc:
+        activity("request.error", f"Meltano pipeline emit failed: {exc}", level="error", source_type=dest_type)
+        raise HTTPException(status_code=500, detail=f"Emission failed: {exc}") from exc
+
+    activity(
+        "sync.meltano_pipeline",
+        f"Pipeline complete: {rows_read} read, {emit_result.rows_written} written",
+        source_type=source_type,
+        metadata={"rows_read": rows_read, "rows_written": emit_result.rows_written},
+    )
+
+    return RunMeltanoPipelineResponse(
+        rows_read=rows_read,
+        rows_written=emit_result.rows_written,
+        rows_skipped=emit_result.rows_skipped,
+        rows_failed=emit_result.rows_failed,
+        checkpoint=merge_state(payload.checkpoint, collect_result["state"]),
+        errors=emit_result.errors or [],
+    )
 
 
 @app.post("/delta-check/{source_type}", response_model=DeltaCheckResponse)
