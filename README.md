@@ -2,6 +2,8 @@
 
 FastAPI microservice for data extraction, transformation, and loading (ETL) operations.
 
+**Vercel + Meltano**: See [VERCEL_DEPLOYMENT.md](../../VERCEL_DEPLOYMENT.md) for deploying ETL, API (NestJS), and Meltano pipelines to Vercel.
+
 ## Features
 
 - **Data Collection**: Extract data from PostgreSQL, MySQL, and MongoDB using Singer taps

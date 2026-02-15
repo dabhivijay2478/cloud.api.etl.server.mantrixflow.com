@@ -1,5 +1,7 @@
 # Vercel Deployment Guide for Python ETL Service
 
+> **See [VERCEL_DEPLOYMENT.md](../../VERCEL_DEPLOYMENT.md)** at repo root for the full monorepo guide (ETL + API + Meltano).
+
 This guide explains how to deploy the FastAPI ETL microservice to Vercel using Python serverless functions.
 
 ## Prerequisites
