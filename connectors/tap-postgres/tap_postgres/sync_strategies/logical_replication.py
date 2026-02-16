@@ -387,13 +387,19 @@ def locate_replication_slot(conn_info):
                 LOGGER.info("using pg_replication_slot %s", db_specific_slot)
                 return db_specific_slot
 
-
             cur.execute("SELECT * FROM pg_replication_slots WHERE slot_name = 'stitch' AND plugin = 'wal2json'")
             if len(cur.fetchall()) == 1:
                 LOGGER.info("using pg_replication_slot 'stitch'")
                 return 'stitch'
 
-            raise Exception("Unable to find replication slot (stitch || {} with wal2json".format(db_specific_slot))
+            cur.execute("SHOW wal_level")
+            wal_level = cur.fetchone()[0] if cur.rowcount else "unknown"
+            raise Exception(
+                "Incremental sync for PostgreSQL requires logical replication. "
+                "Enable it in your database provider (e.g. Neon: Settings → Beta → Enable logical replication), "
+                "then create a replication slot: SELECT * FROM pg_create_logical_replication_slot('{}', 'wal2json'); "
+                "(Current wal_level: {})".format(db_specific_slot, wal_level)
+            )
 
 
 def sync_tables(conn_info, logical_streams, state, end_lsn):

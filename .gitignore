@@ -31,6 +31,9 @@ env/
 .DS_Store
 Thumbs.db
 
+# Tests (local only - do not push to GitHub)
+tests/
+
 # Logs
 *.log
 logs/

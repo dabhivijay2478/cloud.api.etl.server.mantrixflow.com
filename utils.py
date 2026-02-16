@@ -275,6 +275,10 @@ def stream_matches(
         str(stream.get("stream") or "").lower(),
         str(stream.get("tap_stream_id") or "").lower(),
     }
+    # MongoDB tap_stream_id is "db-collection"; match "collection" or "db-collection"
+    tap_id = str(stream.get("tap_stream_id") or "")
+    if "-" in tap_id:
+        table_candidates.add(tap_id.split("-", 1)[-1].lower())
     root = metadata_root(stream)
     stream_schema = (
         root.get("schema-name")
@@ -314,18 +318,24 @@ def select_catalog_streams(
 
         selected_streams.append(stream)
 
-        desired_mode = "INCREMENTAL" if sync_mode == "incremental" else "FULL_TABLE"
-        if source_type == "postgresql" and sync_mode == "incremental":
-            desired_mode = "INCREMENTAL"
-        root["replication-method"] = desired_mode
-
-        chosen_replication_key = replication_key
-        if not chosen_replication_key:
-            valid_keys = root.get("valid-replication-keys") or []
-            if isinstance(valid_keys, list) and valid_keys:
-                chosen_replication_key = valid_keys[0]
-        if chosen_replication_key:
-            root["replication-key"] = chosen_replication_key
+        desired_mode = "FULL_TABLE"
+        if sync_mode == "incremental" and source_type == "postgresql":
+            if root.get("is-view"):
+                desired_mode = "FULL_TABLE"
+            else:
+                desired_mode = "LOG_BASED"
+                root["replication-key"] = None
+            root["replication-method"] = desired_mode
+        else:
+            chosen_replication_key = replication_key
+            if not chosen_replication_key:
+                valid_keys = root.get("valid-replication-keys") or []
+                if isinstance(valid_keys, list) and valid_keys:
+                    chosen_replication_key = valid_keys[0]
+            if sync_mode == "incremental" and chosen_replication_key:
+                desired_mode = "INCREMENTAL"
+                root["replication-key"] = chosen_replication_key
+            root["replication-method"] = desired_mode
 
         for item in stream.get("metadata", []):
             breadcrumb = item.get("breadcrumb") or []
