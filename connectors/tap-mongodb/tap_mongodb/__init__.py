@@ -68,7 +68,8 @@ def get_roles(client, config):
     #         }
     #     ]
     # }
-    user_info = client[config['database']].command({'usersInfo': config['user']})
+    auth_db = config.get('auth_source') or config['database']
+    user_info = client[auth_db].command({'usersInfo': config['user']})
 
     users = [u for u in user_info.get('users') if u.get('user') == config['user']]
     if len(users) != 1:
@@ -366,7 +367,7 @@ def main_impl():
                          "port": int(config['port']),
                          "username": config.get('user', None),
                          "password": config.get('password', None),
-                         "authSource": config['database'],
+                         "authSource": config.get('auth_source') or config['database'],
                          "ssl": use_ssl,
                          "replicaset": config.get('replica_set', None),
                          "readPreference": 'secondaryPreferred',

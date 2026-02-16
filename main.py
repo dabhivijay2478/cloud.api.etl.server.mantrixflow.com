@@ -11,8 +11,9 @@ from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 import certifi
 from pymongo import MongoClient
@@ -48,6 +49,14 @@ EMIT_CHUNK_SIZE = int(os.getenv("EMIT_CHUNK_SIZE", "1000"))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONNECTORS_DIR = os.path.join(BASE_DIR, "connectors")
+
+
+def _mongo_client_kwargs(uri: str) -> dict:
+    """Return kwargs for MongoClient. Omit tlsCAFile when TLS disabled (local Docker)."""
+    u = uri.lower()
+    if "tls=false" in u or "ssl=false" in u:
+        return {}
+    return {"tlsCAFile": certifi.where()}
 
 
 def _humanize_mysql_auth_error(error_text: str) -> Optional[str]:
@@ -191,6 +200,33 @@ class TestConnectionRequest(BaseModel):
     tls: Optional[bool] = None
 
 
+class RunMeltanoPipelineRequest(BaseModel):
+    """Dynamic Meltano-style pipeline. Connections come from DB (passed by API at run time)."""
+    direction: Literal["postgres-to-mongodb", "mongodb-to-postgres"]
+    source_connection_config: Dict[str, Any]
+    dest_connection_config: Dict[str, Any]
+    source_table: Optional[str] = None
+    source_schema: Optional[str] = "public"
+    dest_table: Optional[str] = None
+    dest_schema: Optional[str] = "public"
+    sync_mode: Literal["full", "incremental"] = "full"
+    write_mode: Literal["append", "upsert", "replace"] = "upsert"
+    upsert_key: Optional[List[str]] = None
+    transform_script: Optional[str] = None
+    checkpoint: Optional[Dict[str, Any]] = None
+    limit: Optional[int] = None
+    replication_key: Optional[str] = None
+
+
+class RunMeltanoPipelineResponse(BaseModel):
+    rows_read: int
+    rows_written: int
+    rows_skipped: int
+    rows_failed: int
+    checkpoint: Dict[str, Any] = Field(default_factory=dict)
+    errors: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 class TestConnectionResponse(BaseModel):
     success: bool
     message: Optional[str] = None
@@ -209,6 +245,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Ensure unhandled exceptions return JSON with detail (HTTPException handled by FastAPI)."""
+    if isinstance(exc, HTTPException):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    etl_log.error("Unhandled exception: %s", exc, exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc), "type": type(exc).__name__},
+    )
 
 
 def _require_jwt(authorization: Optional[str] = Header(default=None)) -> str:
@@ -330,6 +378,24 @@ _MONGO_OID_NS = uuid.UUID("a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d")
 def _objectid_to_uuid(oid: str) -> str:
     """Convert a MongoDB ObjectId hex string to a deterministic UUID v5."""
     return str(uuid.uuid5(_MONGO_OID_NS, oid))
+
+
+def _mongo_id_to_uuid(value: Any) -> str:
+    """Convert any MongoDB _id to a deterministic UUID for Postgres migration.
+    Handles: ObjectId hex (24 chars), string IDs (e.g. 'cust_1'), int, etc.
+    """
+    if value is None:
+        return str(uuid.uuid4())
+    if isinstance(value, str):
+        if len(value) == 24:
+            try:
+                int(value, 16)
+                return _objectid_to_uuid(value)
+            except ValueError:
+                pass
+        return str(uuid.uuid5(_MONGO_OID_NS, value))
+    # ObjectId, int, or other: use string representation for deterministic UUID
+    return str(uuid.uuid5(_MONGO_OID_NS, str(value)))
 
 
 def _is_uuid_column(col) -> bool:
@@ -486,23 +552,14 @@ def _emit_to_sql(
             id_is_uuid = True
             break
 
-    has_id_column = "id" in table_columns
     if id_is_uuid:
         for rec in records:
             raw_id = rec.get("id")
-            if isinstance(raw_id, str) and len(raw_id) == 24:
-                try:
-                    int(raw_id, 16)  # validate it's hex
-                    rec["id"] = _objectid_to_uuid(raw_id)
-                except ValueError:
-                    pass  # not a hex ObjectId, leave as-is
-
-    # If the table has a UUID ``id`` column but the record has no id (e.g. transform
-    # dropped _id), generate a deterministic UUID so NOT NULL is satisfied.
-    if has_id_column and id_is_uuid:
-        for rec in records:
-            if rec.get("id") is None or rec.get("id") == "":
+            if raw_id is None or raw_id == "":
                 rec["id"] = str(uuid.uuid5(_MONGO_OID_NS, json.dumps(rec, sort_keys=True, default=str)))
+            else:
+                # Convert any MongoDB _id (ObjectId hex, string, int, etc.) to UUID
+                rec["id"] = _mongo_id_to_uuid(raw_id)
 
     rows_written = 0
     rows_failed = 0
@@ -597,7 +654,7 @@ def _emit_to_mongodb(
     if not database_name:
         raise ValueError("MongoDB database is required")
 
-    client = MongoClient(connection_uri, tlsCAFile=certifi.where())
+    client = MongoClient(connection_uri, **_mongo_client_kwargs(connection_uri))
     collection = client[database_name][table_name]
     rows_written = 0
     rows_failed = 0
@@ -838,6 +895,130 @@ async def emit(
     raise HTTPException(status_code=400, detail=f"Unsupported destination type: {dest_type}")
 
 
+@app.post("/run-meltano-pipeline", response_model=RunMeltanoPipelineResponse)
+async def run_meltano_pipeline(
+    payload: RunMeltanoPipelineRequest,
+    _token: str = Depends(_require_jwt),
+) -> RunMeltanoPipelineResponse:
+    """
+    Run a Meltano-style pipeline with **dynamic connections** from the database.
+    The API fetches source and dest connection configs from data_source_connections
+    and passes them here. Supports postgres-to-mongodb and mongodb-to-postgres.
+    """
+    direction = payload.direction
+    if direction == "postgres-to-mongodb":
+        source_type = "postgresql"
+        dest_type = "mongodb"
+    else:
+        source_type = "mongodb"
+        dest_type = "postgresql"
+
+    dest_table = payload.dest_table or payload.source_table
+    if not dest_table:
+        raise HTTPException(status_code=400, detail="source_table or dest_table is required")
+
+    activity(
+        "sync.meltano_pipeline",
+        f"Running {direction}: collect from {source_type} -> emit to {dest_type}",
+        source_type=source_type,
+        metadata={"source_table": payload.source_table, "dest_table": dest_table},
+    )
+
+    singer_config = build_singer_config(
+        source_type,
+        payload.source_connection_config,
+        {
+            "table": payload.source_table,
+            "schema": payload.source_schema,
+        },
+    )
+
+    try:
+        discovery_catalog = await asyncio.to_thread(_run_discovery_sync, source_type, singer_config)
+        # MongoDB has no "public" schema; use schema_name=None to match by table only
+        schema_filter = None if source_type == "mongodb" else payload.source_schema
+        selected_catalog, _ = select_catalog_streams(
+            source_type,
+            discovery_catalog,
+            table_name=payload.source_table,
+            schema_name=schema_filter,
+            sync_mode=payload.sync_mode,
+            replication_key=payload.replication_key,
+        )
+        collect_result = await asyncio.to_thread(
+            _run_collect_sync,
+            source_type,
+            singer_config,
+            selected_catalog,
+            payload.checkpoint,
+        )
+    except ETLRuntimeError as exc:
+        activity("request.error", f"Meltano pipeline collect failed: {exc}", level="error", source_type=source_type)
+        raise HTTPException(status_code=502, detail=f"Collection failed: {exc}") from exc
+
+    records = collect_result["records"]
+    if payload.limit:
+        records = records[: payload.limit]
+
+    rows_read = len(records)
+    if rows_read == 0:
+        return RunMeltanoPipelineResponse(
+            rows_read=0,
+            rows_written=0,
+            rows_skipped=0,
+            rows_failed=0,
+            checkpoint=merge_state(payload.checkpoint, collect_result["state"]),
+        )
+
+    if payload.transform_script:
+        validation = validate_transform_script(payload.transform_script)
+        if not validation.get("valid", False):
+            raise HTTPException(status_code=400, detail=validation.get("error", "Invalid transform script"))
+        transform_result = safe_exec_transform(records, payload.transform_script)
+        records = transform_result["transformed_rows"]
+
+    upsert_keys = payload.upsert_key or []
+    try:
+        if dest_type == "mongodb":
+            emit_result = _emit_to_mongodb(
+                payload.dest_connection_config,
+                dest_table,
+                payload.write_mode,
+                upsert_keys,
+                records,
+            )
+        else:
+            emit_result = _emit_to_sql(
+                dest_type,
+                payload.dest_connection_config,
+                dest_table,
+                payload.dest_schema,
+                payload.write_mode,
+                upsert_keys,
+                records,
+            )
+    except (ValueError, Exception) as exc:
+        activity("request.error", f"Meltano pipeline emit failed: {exc}", level="error", source_type=dest_type)
+        detail = f"Emission failed: {exc}"
+        raise HTTPException(status_code=500, detail=detail) from exc
+
+    activity(
+        "sync.meltano_pipeline",
+        f"Pipeline complete: {rows_read} read, {emit_result.rows_written} written",
+        source_type=source_type,
+        metadata={"rows_read": rows_read, "rows_written": emit_result.rows_written},
+    )
+
+    return RunMeltanoPipelineResponse(
+        rows_read=rows_read,
+        rows_written=emit_result.rows_written,
+        rows_skipped=emit_result.rows_skipped,
+        rows_failed=emit_result.rows_failed,
+        checkpoint=merge_state(payload.checkpoint, collect_result["state"]),
+        errors=emit_result.errors or [],
+    )
+
+
 @app.post("/delta-check/{source_type}", response_model=DeltaCheckResponse)
 async def delta_check(
     source_type: str,
@@ -883,7 +1064,7 @@ async def test_connection(
             else:
                 uri = f"mongodb://{host}:{port}/{db_name}"
         try:
-            client = MongoClient(uri, serverSelectionTimeoutMS=5000, tlsCAFile=certifi.where())
+            client = MongoClient(uri, serverSelectionTimeoutMS=5000, **_mongo_client_kwargs(uri))
             client.admin.command("ping")
             client.close()
             return TestConnectionResponse(success=True, message="MongoDB connection successful")
