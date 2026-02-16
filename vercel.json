@@ -1,7 +1,13 @@
 {
   "version": 2,
+  "builds": [
+    {
+      "src": "api/index.py",
+      "use": "@vercel/python",
+      "config": {"maxDuration": 60}
+    }
+  ],
   "routes": [{"src": "/(.*)", "dest": "api/index.py"}],
   "env": {"PYTHON_VERSION": "3.11"},
-  "installCommand": "pip install --upgrade pip setuptools wheel && pip install -r requirements.txt && pip install -e ./connectors/tap-postgres && pip install -e ./connectors/tap-mysql && pip install -e ./connectors/tap-mongodb",
-  "functions": {"api/index.py": {"maxDuration": 60}}
+  "installCommand": "pip install --upgrade pip setuptools wheel && pip install -r requirements.txt && pip install -e ./connectors/tap-postgres && pip install -e ./connectors/tap-mysql && pip install -e ./connectors/tap-mongodb"
 }
