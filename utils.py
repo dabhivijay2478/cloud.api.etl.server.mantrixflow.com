@@ -275,6 +275,10 @@ def stream_matches(
         str(stream.get("stream") or "").lower(),
         str(stream.get("tap_stream_id") or "").lower(),
     }
+    # MongoDB tap_stream_id is "db-collection"; match "collection" or "db-collection"
+    tap_id = str(stream.get("tap_stream_id") or "")
+    if "-" in tap_id:
+        table_candidates.add(tap_id.split("-", 1)[-1].lower())
     root = metadata_root(stream)
     stream_schema = (
         root.get("schema-name")
