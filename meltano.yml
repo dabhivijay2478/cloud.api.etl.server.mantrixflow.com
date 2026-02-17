@@ -12,6 +12,10 @@
 #   Run: meltano install && meltano run mongodb-to-postgres
 
 project_id: ai-bi-etl
+default_environment: dev
+
+environments:
+  - name: dev
 
 plugins:
   extractors:
@@ -21,6 +25,15 @@ plugins:
         sqlalchemy_url: ${POSTGRES_URL}
         default_replication_method: INCREMENTAL
         filter_schemas: ["public"]
+      select:
+        - "*.*"
+
+    - name: tap-mysql
+      variant: meltanolabs
+      config:
+        sqlalchemy_url: ${MYSQL_URL}
+        default_replication_method: INCREMENTAL
+        filter_schemas: []
       select:
         - "*.*"
 
@@ -46,6 +59,19 @@ plugins:
         flattening_enabled: true
         flattening_max_depth: 5
 
+  utilities:
+    - name: dbt-postgres
+      variant: dbt-labs
+      config:
+        project_dir: transform
+        profiles_dir: transform/profiles/postgres
+        host: ${POSTGRES_HOST:-localhost}
+        port: ${POSTGRES_PORT:-5432}
+        user: ${POSTGRES_USER}
+        password: ${POSTGRES_PASSWORD}
+        dbname: ${POSTGRES_DBNAME:-postgres}
+        schema: public
+
 # target-mongodb (hotglue) removed: fails on Python 3.12 due to pendulum/distutils.
 # For postgres-to-mongodb use: POST /run-meltano-pipeline (dynamic mode).
 
@@ -54,6 +80,19 @@ jobs:
     tasks:
       - tap-mongodb
       - target-postgres
+      - dbt-postgres
+
+  - name: postgres-to-postgres
+    tasks:
+      - tap-postgres
+      - target-postgres
+      - dbt-postgres
+
+  - name: mysql-to-postgres
+    tasks:
+      - tap-mysql
+      - target-postgres
+      - dbt-postgres
 
 schedules:
   - name: mongodb-to-postgres-hourly

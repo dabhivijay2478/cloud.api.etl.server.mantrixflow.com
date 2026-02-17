@@ -1,0 +1,12 @@
+# MANTrixFlow dbt project - runs after tap → target load
+# https://docs.getdbt.com/reference/dbt_project.yml
+
+name: mantrixflow_transform
+version: 1.0.0
+config-version: 2
+
+profile: mantrixflow
+
+model-paths: ["models"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]

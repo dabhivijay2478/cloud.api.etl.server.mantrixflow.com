@@ -137,8 +137,8 @@ def build_singer_config(
         cfg["dbname"] = database
     if source_type == "mysql" and database is not None:
         cfg["database"] = database
-    if source_type == "mongodb" and database is not None:
-        cfg["database"] = database
+    if source_type == "mongodb":
+        cfg["database"] = database if database else (cfg.get("database") or "admin")
 
     if conn.get("ssl") is not None:
         ssl_value = conn["ssl"]
@@ -149,8 +149,18 @@ def build_singer_config(
 
     if conn.get("replica_set") is not None:
         cfg["replica_set"] = conn["replica_set"]
-    if conn.get("auth_source") is not None:
-        cfg["auth_source"] = conn["auth_source"]
+    # MongoDB: auth_source is required for SCRAM auth. Default to "admin" when
+    # credentials exist but auth_source is missing—most users are created in admin.
+    if source_type == "mongodb":
+        auth_src = (
+            conn.get("auth_source")
+            or conn.get("authSource")  # camelCase from frontend
+            or cfg.get("auth_source")
+        )
+        if auth_src:
+            cfg["auth_source"] = auth_src
+        elif username or cfg.get("user"):
+            cfg["auth_source"] = "admin"
     if conn.get("tls") is not None:
         cfg["tls"] = conn["tls"]
 
@@ -396,6 +406,27 @@ def extract_schema(
     }
 
 
+def _extract_columns_from_stream(stream: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract column name, type, nullable from stream schema.properties."""
+    schema = stream.get("schema") or {}
+    properties = schema.get("properties") or {}
+    columns: List[Dict[str, Any]] = []
+    for key, value in properties.items():
+        json_type = "string"
+        nullable = True
+        if isinstance(value, dict):
+            field_type = value.get("type", "string")
+            if isinstance(field_type, list):
+                non_null = [t for t in field_type if t != "null"]
+                json_type = non_null[0] if non_null else "string"
+                nullable = "null" in field_type
+            else:
+                json_type = str(field_type)
+                nullable = field_type == "null"
+        columns.append({"name": key, "type": json_type, "nullable": nullable})
+    return columns
+
+
 def catalog_to_schemas(catalog: Dict[str, Any]) -> List[Dict[str, Any]]:
     grouped: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
@@ -417,7 +448,7 @@ def catalog_to_schemas(catalog: Dict[str, Any]) -> List[Dict[str, Any]]:
         if "." in table_name:
             table_name = table_name.split(".")[-1]
 
-        table_entry = {
+        table_entry: Dict[str, Any] = {
             "name": table_name,
             "schema": schema_key,
             "type": "table",
@@ -425,6 +456,10 @@ def catalog_to_schemas(catalog: Dict[str, Any]) -> List[Dict[str, Any]]:
         row_count = root.get("row-count")
         if row_count is not None:
             table_entry["rowCount"] = row_count
+
+        columns = _extract_columns_from_stream(stream)
+        if columns:
+            table_entry["columns"] = columns
 
         schema_tables = grouped.setdefault(schema_key, {})
         schema_tables[table_name] = table_entry

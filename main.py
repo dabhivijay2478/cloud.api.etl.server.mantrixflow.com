@@ -24,6 +24,12 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from etl_logger import activity, logger as etl_log
+from orchestration.collect import run_collect_via_meltano
+from orchestration.discovery import run_discovery
+from orchestration.pipeline_runner import (
+    get_job_for_direction,
+    run_pipeline_job,
+)
 from transformer import safe_exec_transform, validate_transform_script
 from utils import (
     ETLRuntimeError,
@@ -216,6 +222,7 @@ class RunMeltanoPipelineRequest(BaseModel):
     checkpoint: Optional[Dict[str, Any]] = None
     limit: Optional[int] = None
     replication_key: Optional[str] = None
+    state_id: Optional[str] = None
 
 
 class RunMeltanoPipelineResponse(BaseModel):
@@ -281,6 +288,7 @@ def _tap_pythonpath() -> str:
 
 
 def _tap_command(source_type: str) -> List[str]:
+    """DEPRECATED: Use orchestration.discovery.run_discovery via Meltano. Kept as fallback."""
     source_type = ensure_supported_source(source_type)
     if source_type == "postgresql":
         return [sys.executable, "-c", "import tap_postgres; tap_postgres.main()"]
@@ -306,6 +314,7 @@ def _tap_env() -> Dict[str, str]:
 
 
 def _run_discovery_sync(source_type: str, singer_config: Dict[str, Any]) -> Dict[str, Any]:
+    """DEPRECATED: Use orchestration.discovery.run_discovery. Kept as fallback when Meltano unavailable."""
     env = _tap_env()
 
     with temporary_json_file(singer_config) as config_path:
@@ -702,6 +711,11 @@ async def health() -> Dict[str, str]:
     return {"status": "healthy"}
 
 
+def _run_discovery_source_type(source_type: str, singer_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Legacy discovery via direct tap execution. Kept as fallback when Meltano is unavailable."""
+    return _run_discovery_sync(source_type, singer_config)
+
+
 @app.post("/discover-schema/{source_type}", response_model=DiscoverSchemaResponse)
 async def discover_schema(
     source_type: str,
@@ -712,6 +726,7 @@ async def discover_schema(
     activity("datasource.schema_discovered", f"Discovering schema for {normalized_source}", source_type=normalized_source, metadata={
         "table_name": payload.table_name, "schema_name": payload.schema_name,
     })
+
     singer_config = build_singer_config(
         normalized_source,
         payload.connection_config,
@@ -723,28 +738,45 @@ async def discover_schema(
         },
     )
 
-    try:
-        catalog = await asyncio.to_thread(_run_discovery_sync, normalized_source, singer_config)
-        schema = extract_schema(catalog, table_name=payload.table_name, schema_name=payload.schema_name)
-        activity("datasource.schema_discovered", f"Schema discovered: {len(schema['columns'])} columns", source_type=normalized_source, metadata={
-            "column_count": len(schema["columns"]), "primary_keys": schema["primary_keys"],
-        })
-        return DiscoverSchemaResponse(
-            columns=schema["columns"],
-            primary_keys=schema["primary_keys"],
-            estimated_row_count=schema.get("estimated_row_count"),
-            schemas=catalog_to_schemas(catalog),
-        )
-    except ETLRuntimeError as exc:
-        mysql_auth_error = _humanize_mysql_auth_error(str(exc))
-        if mysql_auth_error:
-            activity("request.error", f"Schema discovery failed: {mysql_auth_error}", level="error", source_type=normalized_source)
-            raise HTTPException(status_code=400, detail=mysql_auth_error) from exc
-        activity("request.error", f"Singer discovery failed: {exc}", level="error", source_type=normalized_source)
-        raise HTTPException(status_code=502, detail=f"Singer discovery failed: {exc}") from exc
-    except ValueError as exc:
-        activity("request.error", f"Schema discovery validation error: {exc}", level="warn", source_type=normalized_source)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    use_meltano = os.getenv("USE_MELTANO_DISCOVERY", "true").lower() in ("true", "1", "yes")
+    catalog = None
+
+    if use_meltano:
+        try:
+            catalog = await run_discovery(
+                normalized_source,
+                payload.connection_config,
+                timeout_seconds=TAP_TIMEOUT_SECONDS,
+            )
+        except (RuntimeError, Exception) as exc:
+            etl_log.warning("Meltano discovery failed, falling back to legacy: %s", exc)
+            catalog = None
+
+    if catalog is None:
+        try:
+            catalog = await asyncio.to_thread(_run_discovery_source_type, normalized_source, singer_config)
+        except ETLRuntimeError as exc:
+            mysql_auth_error = _humanize_mysql_auth_error(str(exc))
+            if mysql_auth_error:
+                activity("request.error", f"Schema discovery failed: {mysql_auth_error}", level="error", source_type=normalized_source)
+                raise HTTPException(status_code=400, detail=mysql_auth_error) from exc
+            activity("request.error", f"Singer discovery failed: {exc}", level="error", source_type=normalized_source)
+            raise HTTPException(status_code=502, detail=f"Singer discovery failed: {exc}") from exc
+        except Exception as exc:
+            msg = str(exc) or "Schema discovery failed"
+            activity("request.error", msg, level="error", source_type=normalized_source)
+            raise HTTPException(status_code=502, detail=msg) from exc
+
+    schema = extract_schema(catalog, table_name=payload.table_name, schema_name=payload.schema_name)
+    activity("datasource.schema_discovered", f"Schema discovered: {len(schema['columns'])} columns", source_type=normalized_source, metadata={
+        "column_count": len(schema["columns"]), "primary_keys": schema["primary_keys"],
+    })
+    return DiscoverSchemaResponse(
+        columns=schema["columns"],
+        primary_keys=schema["primary_keys"],
+        estimated_row_count=schema.get("estimated_row_count"),
+        schemas=catalog_to_schemas(catalog),
+    )
 
 
 @app.post("/collect/{source_type}", response_model=CollectResponse)
@@ -768,39 +800,70 @@ async def collect(
         },
     )
 
-    try:
-        discovery_catalog = await asyncio.to_thread(_run_discovery_sync, normalized_source, singer_config)
-        selected_catalog, _selected_streams = select_catalog_streams(
-            normalized_source,
-            discovery_catalog,
-            table_name=payload.table_name,
-            schema_name=payload.schema_name,
-            sync_mode=payload.sync_mode,
-            replication_key=payload.replication_key,
-        )
-        collect_result = await asyncio.to_thread(
-            _run_collect_sync,
-            normalized_source,
-            singer_config,
-            selected_catalog,
-            payload.checkpoint,
-        )
-    except ETLRuntimeError as exc:
-        error_msg = str(exc)
-        activity("request.error", f"Singer collect failed for {normalized_source}: {error_msg[:500]}", level="error", source_type=normalized_source, metadata={
-            "table_name": payload.table_name, "sync_mode": payload.sync_mode,
-        })
-        mysql_auth_error = _humanize_mysql_auth_error(error_msg)
-        if mysql_auth_error:
-            raise HTTPException(status_code=400, detail=mysql_auth_error) from exc
-        raise HTTPException(status_code=502, detail=f"Singer collect failed: {error_msg[:2000]}") from exc
-    except ValueError as exc:
-        activity("request.error", f"Collect validation error: {exc}", level="warn", source_type=normalized_source)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        error_msg = str(exc)
-        activity("request.error", f"Unexpected collect error for {normalized_source}: {error_msg[:500]}", level="error", source_type=normalized_source)
-        raise HTTPException(status_code=500, detail=f"Internal collect error: {error_msg[:2000]}") from exc
+    use_meltano_collect = os.getenv("USE_MELTANO_COLLECT", "false").lower() in ("true", "1", "yes")
+    collect_result = None
+
+    if use_meltano_collect:
+        try:
+            discovery_catalog = await run_discovery(
+                normalized_source,
+                payload.connection_config,
+                timeout_seconds=TAP_TIMEOUT_SECONDS,
+            )
+            selected_catalog, _selected_streams = select_catalog_streams(
+                normalized_source,
+                discovery_catalog,
+                table_name=payload.table_name,
+                schema_name=payload.schema_name,
+                sync_mode=payload.sync_mode,
+                replication_key=payload.replication_key,
+            )
+            collect_result = await run_collect_via_meltano(
+                normalized_source,
+                payload.connection_config,
+                selected_catalog,
+                state=payload.checkpoint,
+                singer_config=singer_config,
+                timeout_seconds=TAP_TIMEOUT_SECONDS,
+            )
+        except (RuntimeError, Exception) as exc:
+            etl_log.warning("Meltano collect failed, falling back to legacy: %s", exc)
+            collect_result = None
+
+    if collect_result is None:
+        try:
+            discovery_catalog = await asyncio.to_thread(_run_discovery_sync, normalized_source, singer_config)
+            selected_catalog, _selected_streams = select_catalog_streams(
+                normalized_source,
+                discovery_catalog,
+                table_name=payload.table_name,
+                schema_name=payload.schema_name,
+                sync_mode=payload.sync_mode,
+                replication_key=payload.replication_key,
+            )
+            collect_result = await asyncio.to_thread(
+                _run_collect_sync,
+                normalized_source,
+                singer_config,
+                selected_catalog,
+                payload.checkpoint,
+            )
+        except ETLRuntimeError as exc:
+            error_msg = str(exc)
+            activity("request.error", f"Singer collect failed for {normalized_source}: {error_msg[:500]}", level="error", source_type=normalized_source, metadata={
+                "table_name": payload.table_name, "sync_mode": payload.sync_mode,
+            })
+            mysql_auth_error = _humanize_mysql_auth_error(error_msg)
+            if mysql_auth_error:
+                raise HTTPException(status_code=400, detail=mysql_auth_error) from exc
+            raise HTTPException(status_code=502, detail=f"Singer collect failed: {error_msg[:2000]}") from exc
+        except ValueError as exc:
+            activity("request.error", f"Collect validation error: {exc}", level="warn", source_type=normalized_source)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            error_msg = str(exc)
+            activity("request.error", f"Unexpected collect error for {normalized_source}: {error_msg[:500]}", level="error", source_type=normalized_source)
+            raise HTTPException(status_code=500, detail=f"Internal collect error: {error_msg[:2000]}") from exc
 
     all_records = collect_result["records"]
     total_rows = len(all_records)
@@ -895,6 +958,74 @@ async def emit(
     raise HTTPException(status_code=400, detail=f"Unsupported destination type: {dest_type}")
 
 
+def _run_meltano_pipeline_legacy(
+    payload: RunMeltanoPipelineRequest,
+    source_type: str,
+    dest_type: str,
+    dest_table: str,
+) -> RunMeltanoPipelineResponse:
+    """Legacy path: manual collect + transform + emit. Used when no Meltano job or single-table sync."""
+    singer_config = build_singer_config(
+        source_type,
+        payload.source_connection_config,
+        {"table": payload.source_table, "schema": payload.source_schema},
+    )
+    discovery_catalog = _run_discovery_sync(source_type, singer_config)
+    schema_filter = None if source_type == "mongodb" else payload.source_schema
+    selected_catalog, _ = select_catalog_streams(
+        source_type,
+        discovery_catalog,
+        table_name=payload.source_table,
+        schema_name=schema_filter,
+        sync_mode=payload.sync_mode,
+        replication_key=payload.replication_key,
+    )
+    collect_result = _run_collect_sync(
+        source_type, singer_config, selected_catalog, payload.checkpoint
+    )
+    records = collect_result["records"]
+    if payload.limit:
+        records = records[: payload.limit]
+    rows_read = len(records)
+    if rows_read == 0:
+        return RunMeltanoPipelineResponse(
+            rows_read=0,
+            rows_written=0,
+            rows_skipped=0,
+            rows_failed=0,
+            checkpoint=merge_state(payload.checkpoint, collect_result["state"]),
+        )
+    if payload.transform_script:
+        validation = validate_transform_script(payload.transform_script)
+        if not validation.get("valid", False):
+            raise HTTPException(status_code=400, detail=validation.get("error", "Invalid transform script"))
+        transform_result = safe_exec_transform(records, payload.transform_script)
+        records = transform_result["transformed_rows"]
+    upsert_keys = payload.upsert_key or []
+    if dest_type == "mongodb":
+        emit_result = _emit_to_mongodb(
+            payload.dest_connection_config, dest_table, payload.write_mode, upsert_keys, records
+        )
+    else:
+        emit_result = _emit_to_sql(
+            dest_type,
+            payload.dest_connection_config,
+            dest_table,
+            payload.dest_schema,
+            payload.write_mode,
+            upsert_keys,
+            records,
+        )
+    return RunMeltanoPipelineResponse(
+        rows_read=rows_read,
+        rows_written=emit_result.rows_written,
+        rows_skipped=emit_result.rows_skipped,
+        rows_failed=emit_result.rows_failed,
+        checkpoint=merge_state(payload.checkpoint, collect_result["state"]),
+        errors=emit_result.errors or [],
+    )
+
+
 @app.post("/run-meltano-pipeline", response_model=RunMeltanoPipelineResponse)
 async def run_meltano_pipeline(
     payload: RunMeltanoPipelineRequest,
@@ -902,8 +1033,8 @@ async def run_meltano_pipeline(
 ) -> RunMeltanoPipelineResponse:
     """
     Run a Meltano-style pipeline with **dynamic connections** from the database.
-    The API fetches source and dest connection configs from data_source_connections
-    and passes them here. Supports postgres-to-mongodb and mongodb-to-postgres.
+    Uses Meltano when a job exists (mongodb-to-postgres); falls back to legacy for
+    postgres-to-mongodb or when single-table sync or transform_script is requested.
     """
     direction = payload.direction
     if direction == "postgres-to-mongodb":
@@ -924,98 +1055,70 @@ async def run_meltano_pipeline(
         metadata={"source_table": payload.source_table, "dest_table": dest_table},
     )
 
-    singer_config = build_singer_config(
-        source_type,
-        payload.source_connection_config,
-        {
-            "table": payload.source_table,
-            "schema": payload.source_schema,
-        },
+    use_meltano = os.getenv("USE_MELTANO_PIPELINE", "true").lower() in ("true", "1", "yes")
+    job_name = get_job_for_direction(source_type, dest_type)
+    use_legacy = (
+        not use_meltano
+        or job_name is None
+        or payload.source_table is not None
+        or payload.transform_script is not None
     )
 
-    try:
-        discovery_catalog = await asyncio.to_thread(_run_discovery_sync, source_type, singer_config)
-        # MongoDB has no "public" schema; use schema_name=None to match by table only
-        schema_filter = None if source_type == "mongodb" else payload.source_schema
-        selected_catalog, _ = select_catalog_streams(
-            source_type,
-            discovery_catalog,
-            table_name=payload.source_table,
-            schema_name=schema_filter,
-            sync_mode=payload.sync_mode,
-            replication_key=payload.replication_key,
-        )
-        collect_result = await asyncio.to_thread(
-            _run_collect_sync,
-            source_type,
-            singer_config,
-            selected_catalog,
-            payload.checkpoint,
-        )
-    except ETLRuntimeError as exc:
-        activity("request.error", f"Meltano pipeline collect failed: {exc}", level="error", source_type=source_type)
-        raise HTTPException(status_code=502, detail=f"Collection failed: {exc}") from exc
-
-    records = collect_result["records"]
-    if payload.limit:
-        records = records[: payload.limit]
-
-    rows_read = len(records)
-    if rows_read == 0:
-        return RunMeltanoPipelineResponse(
-            rows_read=0,
-            rows_written=0,
-            rows_skipped=0,
-            rows_failed=0,
-            checkpoint=merge_state(payload.checkpoint, collect_result["state"]),
-        )
-
-    if payload.transform_script:
-        validation = validate_transform_script(payload.transform_script)
-        if not validation.get("valid", False):
-            raise HTTPException(status_code=400, detail=validation.get("error", "Invalid transform script"))
-        transform_result = safe_exec_transform(records, payload.transform_script)
-        records = transform_result["transformed_rows"]
-
-    upsert_keys = payload.upsert_key or []
-    try:
-        if dest_type == "mongodb":
-            emit_result = _emit_to_mongodb(
-                payload.dest_connection_config,
-                dest_table,
-                payload.write_mode,
-                upsert_keys,
-                records,
-            )
-        else:
-            emit_result = _emit_to_sql(
+    if use_legacy:
+        try:
+            return await asyncio.to_thread(
+                _run_meltano_pipeline_legacy,
+                payload,
+                source_type,
                 dest_type,
-                payload.dest_connection_config,
                 dest_table,
-                payload.dest_schema,
-                payload.write_mode,
-                upsert_keys,
-                records,
             )
-    except (ValueError, Exception) as exc:
-        activity("request.error", f"Meltano pipeline emit failed: {exc}", level="error", source_type=dest_type)
-        detail = f"Emission failed: {exc}"
-        raise HTTPException(status_code=500, detail=detail) from exc
+        except ETLRuntimeError as exc:
+            activity("request.error", f"Pipeline collect failed: {exc}", level="error", source_type=source_type)
+            raise HTTPException(status_code=502, detail=f"Collection failed: {exc}") from exc
+
+    try:
+        result = await run_pipeline_job(
+            job_name,
+            source_type,
+            payload.source_connection_config,
+            dest_type,
+            payload.dest_connection_config,
+            state_id=payload.state_id,
+            checkpoint=payload.checkpoint,
+            timeout_seconds=TAP_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        etl_log.warning("Meltano pipeline failed, falling back to legacy: %s", exc)
+        try:
+            return await asyncio.to_thread(
+                _run_meltano_pipeline_legacy,
+                payload,
+                source_type,
+                dest_type,
+                dest_table,
+            )
+        except ETLRuntimeError as legacy_exc:
+            raise HTTPException(status_code=502, detail=f"Collection failed: {legacy_exc}") from legacy_exc
+
+    if not result.success:
+        detail = result.user_message or (result.errors[0]["error"] if result.errors else "Pipeline failed")
+        raise HTTPException(status_code=502, detail=detail)
 
     activity(
         "sync.meltano_pipeline",
-        f"Pipeline complete: {rows_read} read, {emit_result.rows_written} written",
+        f"Pipeline complete: {result.rows_read} read, {result.rows_written} written",
         source_type=source_type,
-        metadata={"rows_read": rows_read, "rows_written": emit_result.rows_written},
+        metadata={"rows_read": result.rows_read, "rows_written": result.rows_written},
     )
 
     return RunMeltanoPipelineResponse(
-        rows_read=rows_read,
-        rows_written=emit_result.rows_written,
-        rows_skipped=emit_result.rows_skipped,
-        rows_failed=emit_result.rows_failed,
-        checkpoint=merge_state(payload.checkpoint, collect_result["state"]),
-        errors=emit_result.errors or [],
+        rows_read=result.rows_read,
+        rows_written=result.rows_written,
+        rows_skipped=result.rows_skipped,
+        rows_failed=result.rows_failed,
+        checkpoint=result.checkpoint,
+        errors=result.errors,
     )
 
 

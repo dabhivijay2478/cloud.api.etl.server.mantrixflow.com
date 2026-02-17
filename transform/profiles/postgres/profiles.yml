@@ -1,0 +1,15 @@
+# dbt profiles - uses env vars for dynamic connection (injected by pipeline runner)
+# DBT_POSTGRES_HOST, DBT_POSTGRES_PORT, DBT_POSTGRES_USER, DBT_POSTGRES_PASSWORD, DBT_POSTGRES_DBNAME
+
+mantrixflow:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('DBT_POSTGRES_HOST', 'localhost') }}"
+      port: "{{ env_var('DBT_POSTGRES_PORT', '5432') | int }}"
+      user: "{{ env_var('DBT_POSTGRES_USER', 'postgres') }}"
+      password: "{{ env_var('DBT_POSTGRES_PASSWORD', '') }}"
+      dbname: "{{ env_var('DBT_POSTGRES_DBNAME', 'postgres') }}"
+      schema: "{{ env_var('DBT_POSTGRES_SCHEMA', 'public') }}"
+      threads: 4

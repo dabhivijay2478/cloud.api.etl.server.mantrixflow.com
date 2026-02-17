@@ -1,0 +1,27 @@
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+.venv
+venv
+.env
+.env.*
+!.env.example
+
+# Meltano (rebuilt in container)
+.meltano
+
+# IDE / OS
+.idea
+.vscode
+.DS_Store
+
+# Tests
+.pytest_cache
+.coverage
+htmlcov
+*.log
+
+# Git
+.git
+.gitignore
