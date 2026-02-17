@@ -41,12 +41,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy Python requirements
 COPY requirements.txt ./
 
-# Install Python deps
+# Install Python deps (FastAPI, uvicorn, etc. - taps/targets managed by Meltano)
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Install Singer taps (local connectors - used when Meltano path unavailable)
-COPY connectors/ ./connectors/
-RUN pip install --no-cache-dir -e ./connectors/tap-postgres -e ./connectors/tap-mysql -e ./connectors/tap-mongodb 2>/dev/null || true
 
 # Copy Meltano project and installed plugins from builder
 COPY --from=meltano-builder /app/.meltano /app/.meltano
