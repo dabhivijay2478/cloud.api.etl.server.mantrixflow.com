@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "disable_existing_loggers": true,
+  "formatters": {
+    "singer_formatter": {
+      "()": "singer_sdk.logging.StructuredFormatter"
+    }
+  },
+  "handlers": {
+    "console": {
+      "class": "logging.StreamHandler",
+      "formatter": "singer_formatter",
+      "stream": "ext://sys.stderr"
+    }
+  },
+  "root": {
+    "handlers": [
+      "console"
+    ],
+    "level": "INFO"
+  }
+}
