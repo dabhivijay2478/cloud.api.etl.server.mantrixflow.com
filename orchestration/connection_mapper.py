@@ -178,8 +178,12 @@ def connection_config_to_tap_config(
     """Build tap config for --config file (e.g. collect invoke).
 
     Merges connection config with source_config overrides (table, schema, query).
+    Uses sync_mode from connection_config when present for replication method.
     """
-    config = _connection_config_to_extractor_config(source_type, connection_config)
+    sync_mode = connection_config.get("sync_mode") or connection_config.get("syncMode")
+    config = _connection_config_to_extractor_config(
+        source_type, connection_config, sync_mode=sync_mode
+    )
     if source_config:
         for key, value in source_config.items():
             if value is not None:
