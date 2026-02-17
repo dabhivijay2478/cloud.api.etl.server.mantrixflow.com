@@ -184,10 +184,13 @@ elif [ -f "meltano.yml" ]; then
     if command -v meltano &> /dev/null; then
         echo -e "${YELLOW}📦 Installing Meltano plugins (tap-postgres, tap-mongodb, target-postgres)...${NC}"
         echo -e "${YELLOW}   This may take 2–5 minutes on first run.${NC}"
+        # Upgrade psutil to avoid macOS + Python 3.12 bug (cpu_count_logical SystemError)
+        python3 -m pip install --upgrade "psutil>=6.0.0" --quiet 2>/dev/null || true
         if meltano install; then
             echo -e "${GREEN}✓ Meltano plugins installed${NC}"
         else
-            echo -e "${YELLOW}⚠ Meltano install had issues. Run 'meltano install' manually, or skip with SKIP_MELTANO=1 ./setup.sh${NC}"
+            echo -e "${YELLOW}⚠ Meltano install had issues. Try: python3 -m pip install --upgrade 'psutil>=6.0.0' && meltano install${NC}"
+            echo -e "${YELLOW}   Or skip with SKIP_MELTANO=1 ./setup.sh${NC}"
         fi
     else
         echo -e "${YELLOW}  Meltano not found. For static CLI mode, install with: pipx install meltano${NC}"
