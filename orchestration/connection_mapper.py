@@ -139,20 +139,35 @@ def _build_mongodb_connection_config(conn: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _connection_config_to_extractor_config(
-    source_type: str, connection_config: Dict[str, Any]
+    source_type: str,
+    connection_config: Dict[str, Any],
+    *,
+    sync_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Convert API connection_config to Meltano extractor config keys/values."""
+    """Convert API connection_config to Meltano extractor config keys/values.
+
+    When sync_mode is 'incremental', sets default_replication_method to LOG_BASED
+    (CDC). When 'full' or absent, uses FULL_TABLE.
+    """
     source_type = ensure_supported_source(source_type)
     conn = connection_config or {}
 
     if source_type == "postgresql":
-        return {"sqlalchemy_url": _build_postgres_sqlalchemy_url(conn)}
-    if source_type == "mysql":
-        return {"sqlalchemy_url": _build_mysql_sqlalchemy_url(conn)}
-    if source_type == "mongodb":
-        return _build_mongodb_connection_config(conn)
+        config = {"sqlalchemy_url": _build_postgres_sqlalchemy_url(conn)}
+    elif source_type == "mysql":
+        config = {"sqlalchemy_url": _build_mysql_sqlalchemy_url(conn)}
+    elif source_type == "mongodb":
+        config = _build_mongodb_connection_config(conn)
+    else:
+        raise ValueError(f"Unsupported source type: {source_type}")
 
-    raise ValueError(f"Unsupported source type: {source_type}")
+    # Map sync_mode to Meltano default_replication_method
+    if sync_mode == "incremental":
+        config["default_replication_method"] = "LOG_BASED"
+    else:
+        config["default_replication_method"] = "FULL_TABLE"
+
+    return config
 
 
 def connection_config_to_tap_config(
@@ -208,6 +223,8 @@ def connection_config_to_meltano_env(
     connection_config: Dict[str, Any],
     role: Role = "extractor",
     plugin_name: str | None = None,
+    *,
+    sync_mode: Optional[str] = None,
 ) -> Dict[str, str]:
     """Map generic connection_config to Meltano environment variables.
 
@@ -225,7 +242,9 @@ def connection_config_to_meltano_env(
     if role == "extractor":
         plugin = plugin_name or SOURCE_TYPE_TO_TAP.get(source_type)
         prefix = "MELTANO_EXTRACTOR"
-        config = _connection_config_to_extractor_config(source_type, connection_config)
+        config = _connection_config_to_extractor_config(
+            source_type, connection_config, sync_mode=sync_mode
+        )
     else:
         plugin = plugin_name or SOURCE_TYPE_TO_LOADER.get(source_type)
         prefix = "MELTANO_LOADER"
@@ -281,13 +300,18 @@ def connection_config_to_meltano_env_for_pipeline(
     source_connection_config: Dict[str, Any],
     dest_type: str,
     dest_connection_config: Dict[str, Any],
+    *,
+    sync_mode: Optional[str] = None,
+    dbt_models: Optional[list[str]] = None,
 ) -> Dict[str, str]:
     """Build combined env vars for a full pipeline (extractor + loader + dbt when dest is postgres).
 
     Merges extractor, loader, and dbt-postgres env vars when destination is PostgreSQL.
+    When sync_mode is 'incremental', sets default_replication_method=LOG_BASED for CDC.
+    When dbt_models is provided, sets DBT_SELECT for dbt model selection.
     """
     extractor_env = connection_config_to_meltano_env(
-        source_type, source_connection_config, role="extractor"
+        source_type, source_connection_config, role="extractor", sync_mode=sync_mode
     )
     loader_env = connection_config_to_meltano_env(
         dest_type, dest_connection_config, role="loader"
@@ -297,5 +321,9 @@ def connection_config_to_meltano_env_for_pipeline(
     if dest_type == "postgresql":
         dbt_env = _connection_config_to_dbt_postgres_env(dest_connection_config)
         result.update(dbt_env)
+        if dbt_models and len(dbt_models) > 0:
+            # Pass model selection to dbt. Standard dbt does not read DBT_SELECT;
+            # a dbt_project.yml var or wrapper can use env_var('DBT_SELECT') to apply --select.
+            result["DBT_SELECT"] = " ".join(dbt_models)
 
     return result

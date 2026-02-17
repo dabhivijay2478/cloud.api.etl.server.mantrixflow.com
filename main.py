@@ -148,6 +148,7 @@ class RunMeltanoPipelineRequest(BaseModel):
     write_mode: Literal["append", "upsert", "replace"] = "upsert"
     upsert_key: Optional[List[str]] = None
     transform_script: Optional[str] = None
+    dbt_models: Optional[List[str]] = None  # Selected dbt models; empty/None = run all
     checkpoint: Optional[Dict[str, Any]] = None
     limit: Optional[int] = None
     replication_key: Optional[str] = None
@@ -417,6 +418,8 @@ async def run_meltano_pipeline(
             payload.dest_connection_config,
             state_id=payload.state_id,
             checkpoint=payload.checkpoint,
+            sync_mode=payload.sync_mode,
+            dbt_models=payload.dbt_models,
             timeout_seconds=TAP_TIMEOUT_SECONDS,
         )
     except Exception as exc:

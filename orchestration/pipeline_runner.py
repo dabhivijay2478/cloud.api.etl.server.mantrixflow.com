@@ -61,6 +61,8 @@ async def run_pipeline_job(
     *,
     state_id: Optional[str] = None,
     checkpoint: Optional[Dict[str, Any]] = None,
+    sync_mode: Optional[str] = None,
+    dbt_models: Optional[list[str]] = None,
     timeout_seconds: int = 3600,
 ) -> PipelineRunResult:
     """Run a Meltano pipeline job with dynamic connection config.
@@ -79,7 +81,9 @@ async def run_pipeline_job(
         PipelineRunResult with counts, checkpoint, errors.
     """
     env = connection_config_to_meltano_env_for_pipeline(
-        source_type, source_connection_config, dest_type, dest_connection_config
+        source_type, source_connection_config, dest_type, dest_connection_config,
+        sync_mode=sync_mode,
+        dbt_models=dbt_models,
     )
 
     run_args: list[str] = []
