@@ -99,54 +99,6 @@ class CollectResponse(BaseModel):
     checkpoint: Dict[str, Any] = Field(default_factory=dict)
 
 
-class TransformRequest(BaseModel):
-    records: Optional[List[Dict[str, Any]]] = None
-    rows: Optional[List[Dict[str, Any]]] = None
-    transform_script: str
-
-    @model_validator(mode="after")
-    def validate_payload(self):
-        if self.records is None and self.rows is None:
-            raise ValueError("Either `records` or `rows` is required")
-        return self
-
-    def get_records(self) -> List[Dict[str, Any]]:
-        return self.records if self.records is not None else (self.rows or [])
-
-
-class TransformResponse(BaseModel):
-    transformed_rows: List[Dict[str, Any]]
-    errors: List[Dict[str, Any]]
-
-
-class EmitRequest(BaseModel):
-    destination_type: Optional[str] = None
-    connection_config: Dict[str, Any]
-    destination_config: Dict[str, Any] = Field(default_factory=dict)
-    table_name: str
-    schema_name: Optional[str] = None
-    records: Optional[List[Dict[str, Any]]] = None
-    rows: Optional[List[Dict[str, Any]]] = None
-    write_mode: Literal["append", "upsert", "replace"] = "upsert"
-    upsert_key: Optional[List[str]] = None
-
-    @model_validator(mode="after")
-    def validate_payload(self):
-        if self.records is None and self.rows is None:
-            raise ValueError("Either `records` or `rows` is required")
-        return self
-
-    def get_records(self) -> List[Dict[str, Any]]:
-        return self.records if self.records is not None else (self.rows or [])
-
-
-class EmitResponse(BaseModel):
-    rows_written: int
-    rows_skipped: int
-    rows_failed: int
-    errors: List[Dict[str, Any]]
-
-
 class DeltaCheckRequest(BaseModel):
     connection_config: Dict[str, Any]
     source_config: Dict[str, Any] = Field(default_factory=dict)
@@ -180,7 +132,12 @@ class TestConnectionRequest(BaseModel):
 
 class RunMeltanoPipelineRequest(BaseModel):
     """Dynamic Meltano-style pipeline. Connections come from DB (passed by API at run time)."""
-    direction: Literal["postgres-to-mongodb", "mongodb-to-postgres"]
+    direction: Literal[
+        "postgres-to-mongodb",
+        "mongodb-to-postgres",
+        "postgres-to-postgres",
+        "mysql-to-postgres",
+    ]
     source_connection_config: Dict[str, Any]
     dest_connection_config: Dict[str, Any]
     source_table: Optional[str] = None
@@ -400,31 +357,6 @@ async def collect(
     )
 
 
-@app.post("/transform")
-async def transform(
-    payload: TransformRequest,
-    _token: str = Depends(_require_jwt),
-):
-    """Deprecated. Use POST /run-meltano-pipeline with dbt for transformations."""
-    raise HTTPException(
-        status_code=410,
-        detail="Transform endpoint deprecated. Use POST /run-meltano-pipeline with dbt for transformations.",
-    )
-
-
-@app.post("/emit/{dest_type}")
-async def emit(
-    dest_type: str,
-    payload: EmitRequest,
-    _token: str = Depends(_require_jwt),
-):
-    """Deprecated. Use POST /run-meltano-pipeline for data movement via Meltano loaders."""
-    raise HTTPException(
-        status_code=410,
-        detail="Emit endpoint deprecated. Use POST /run-meltano-pipeline for data movement.",
-    )
-
-
 @app.post("/run-meltano-pipeline", response_model=RunMeltanoPipelineResponse)
 async def run_meltano_pipeline(
     payload: RunMeltanoPipelineRequest,
@@ -435,22 +367,21 @@ async def run_meltano_pipeline(
     """
     direction = payload.direction
     if direction == "postgres-to-mongodb":
-        source_type = "postgresql"
-        dest_type = "mongodb"
+        source_type, dest_type = "postgresql", "mongodb"
+    elif direction == "mongodb-to-postgres":
+        source_type, dest_type = "mongodb", "postgresql"
+    elif direction == "postgres-to-postgres":
+        source_type, dest_type = "postgresql", "postgresql"
+    elif direction == "mysql-to-postgres":
+        source_type, dest_type = "mysql", "postgresql"
     else:
-        source_type = "mongodb"
-        dest_type = "postgresql"
+        raise HTTPException(status_code=400, detail=f"Unsupported direction: {direction}")
 
     job_name = get_job_for_direction(source_type, dest_type)
     if job_name is None:
         raise HTTPException(
             status_code=400,
             detail=f"No Meltano job for direction {direction}. Add a job in meltano.yml for {source_type}→{dest_type}.",
-        )
-    if payload.source_table is not None:
-        raise HTTPException(
-            status_code=400,
-            detail="Single-table sync (source_table) is not supported in Clean Engine. Use full pipeline.",
         )
     if payload.transform_script is not None:
         raise HTTPException(

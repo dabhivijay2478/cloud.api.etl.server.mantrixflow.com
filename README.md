@@ -147,16 +147,6 @@ uvicorn main:app --host 0.0.0.0 --port 8001 --reload
   - Supports `full` and `incremental` sync modes
   - Returns records and updated checkpoint/state
 
-### Data Transformation
-- `POST /transform` - Transform records using custom Python script
-  - Accepts `transform_script` (Python code) and `rows` (data)
-  - Script must define `transform(record)` function
-
-### Data Emission
-- `POST /emit/{destType}` - Emit transformed data to destination
-  - Supported types: `postgresql`, `mongodb`
-  - Supports `append`, `upsert`, and `replace` write modes
-
 ### Connection Testing
 - `POST /test-connection` - Test database connection
   - Validates connection configuration
@@ -203,44 +193,9 @@ curl -X POST http://localhost:8001/discover-schema/postgresql \
   }'
 ```
 
-### Transform Data
+## Run Meltano Pipeline
 
-```bash
-curl -X POST http://localhost:8001/transform \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -d '{
-    "rows": [{"id": 1, "name": "John"}],
-    "transform_script": "def transform(record):\n    return {\"id\": record.get(\"id\"), \"name\": record.get(\"name\")}"
-  }'
-```
-
-## Transform Script Format
-
-The transform script must define a function named `transform` that accepts a `record` parameter:
-
-```python
-import json
-
-def transform(record):
-    """
-    Transform source record to destination format.
-    Use record.get("source_field") to read from source.
-    Return dict with destination keys.
-    """
-    return {
-        "id": record.get("id"),
-        "name": record.get("name"),
-        "email": record.get("email"),
-    }
-```
-
-**Rules:**
-- Function must be named `transform`
-- Accepts `record` parameter (dict)
-- Returns a dict with destination field names as keys
-- Use `record.get("field_name")` to access source fields
-- `json` module is available for JSON parsing
+Use `POST /run-meltano-pipeline` for end-to-end data movement (extract, optional transform via dbt, load). See API docs for supported directions (postgres-to-postgres, mysql-to-postgres, postgres-to-mongodb, mongodb-to-postgres).
 
 ## Development
 

@@ -21,7 +21,6 @@ apps/etl/
 │   └── index.py          # Vercel serverless entrypoint
 ├── connectors/           # Singer taps (tap-postgres, tap-mysql, tap-mongodb)
 ├── main.py              # FastAPI application
-├── transformer.py       # Custom transformation logic
 ├── utils.py             # Utility functions
 ├── requirements.txt     # Python dependencies (includes Mangum)
 ├── vercel.json          # Vercel configuration
@@ -258,8 +257,7 @@ After deployment, all FastAPI endpoints are available:
 - `GET /health` - Health check
 - `POST /discover-schema/{sourceType}` - Discover schema
 - `POST /collect/{sourceType}` - Collect data
-- `POST /transform` - Transform records
-- `POST /emit/{destType}` - Emit data
+- `POST /run-meltano-pipeline` - Run Meltano pipeline (extract, transform, load)
 - `POST /delta-check/{sourceType}` - Incremental sync check
 - `GET /docs` - Swagger UI documentation
 - `GET /openapi.json` - OpenAPI schema

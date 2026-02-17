@@ -56,7 +56,6 @@ COPY --from=meltano-builder /app/transform ./transform
 # Copy application code
 COPY main.py ./
 COPY run.py ./
-COPY transformer.py ./
 COPY etl_logger.py ./
 COPY utils.py ./
 COPY orchestration/ ./orchestration/
