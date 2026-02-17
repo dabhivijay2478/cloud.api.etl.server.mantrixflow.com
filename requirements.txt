@@ -3,21 +3,11 @@ fastapi==0.128.0
 uvicorn[standard]==0.35.0
 pydantic==2.11.7
 polars==1.33.1
-sqlalchemy==2.0.46
-psycopg2-binary==2.9.11
-pymongo==4.15.0
-certifi
-pymysql==1.1.2
 python-dotenv==1.1.1
-singer-python==6.3.0
 python-multipart==0.0.20
 pytest==8.4.2
 httpx==0.28.1
-# Dependencies required by Singer tap connectors
+# Dependencies required by Singer tap connectors (when run via Meltano)
 pendulum>=2.1.2
 backoff>=1.8.0
-mysql-replication>=0.24
-strict-rfc3339>=0.7
-tzlocal>=2.0.0
-attrs>=16.3.0
 setuptools

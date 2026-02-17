@@ -23,7 +23,7 @@ async def run_collect_via_meltano(
     selected_catalog: Dict[str, Any],
     state: Optional[Dict[str, Any]] = None,
     *,
-    singer_config: Optional[Dict[str, Any]] = None,
+    tap_config: Optional[Dict[str, Any]] = None,
     timeout_seconds: int = 1200,
 ) -> Dict[str, Any]:
     """Run tap sync via Meltano invoke; return records and state.
@@ -33,7 +33,7 @@ async def run_collect_via_meltano(
         connection_config: API-style connection config.
         selected_catalog: Singer catalog with selected streams.
         state: Optional checkpoint for incremental sync.
-        singer_config: Full tap config from build_singer_config (table, schema, etc.). If None, uses connection_config.
+        tap_config: Full tap config from connection_config_to_tap_config (table, schema, etc.). If None, uses connection_config.
         timeout_seconds: Max seconds for sync.
 
     Returns:
@@ -49,7 +49,7 @@ async def run_collect_via_meltano(
 
     env = connection_config_to_meltano_env(source_type, connection_config, role="extractor")
     catalog_arg = _catalog_arg_name(source_type)
-    config_data = singer_config or connection_config
+    config_data = tap_config or connection_config
 
     with temporary_json_file(config_data) as config_path, temporary_json_file(
         selected_catalog

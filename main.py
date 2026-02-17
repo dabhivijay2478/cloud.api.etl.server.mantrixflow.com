@@ -2,26 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
-import sys
-import uuid
 from typing import Any, Dict, List, Literal, Optional
-from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
-import certifi
-from pymongo import MongoClient
-from pymongo import UpdateOne
-from sqlalchemy import JSON, BigInteger, Boolean, Column, Float, MetaData, Table, Text, create_engine
-from sqlalchemy import inspect, text
-from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from etl_logger import activity, logger as etl_log
 from orchestration.collect import run_collect_via_meltano
@@ -30,20 +19,13 @@ from orchestration.pipeline_runner import (
     get_job_for_direction,
     run_pipeline_job,
 )
-from transformer import safe_exec_transform, validate_transform_script
+from orchestration.connection_mapper import connection_config_to_tap_config
 from utils import (
-    ETLRuntimeError,
-    build_singer_config,
     catalog_to_schemas,
-    chunked,
     ensure_supported_source,
     extract_schema,
     merge_state,
-    parse_discovery_output,
-    parse_singer_stream,
-    run_command,
     select_catalog_streams,
-    temporary_json_file,
 )
 
 load_dotenv()
@@ -51,18 +33,8 @@ load_dotenv()
 APP_NAME = "python-etl"
 APP_VERSION = "2.0.0"
 TAP_TIMEOUT_SECONDS = int(os.getenv("TAP_TIMEOUT_SECONDS", "1200"))
-EMIT_CHUNK_SIZE = int(os.getenv("EMIT_CHUNK_SIZE", "1000"))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONNECTORS_DIR = os.path.join(BASE_DIR, "connectors")
-
-
-def _mongo_client_kwargs(uri: str) -> dict:
-    """Return kwargs for MongoClient. Omit tlsCAFile when TLS disabled (local Docker)."""
-    u = uri.lower()
-    if "tls=false" in u or "ssl=false" in u:
-        return {}
-    return {"tlsCAFile": certifi.where()}
 
 
 def _humanize_mysql_auth_error(error_text: str) -> Optional[str]:
@@ -277,430 +249,6 @@ def _require_jwt(authorization: Optional[str] = Header(default=None)) -> str:
     return token
 
 
-def _tap_pythonpath() -> str:
-    connector_paths = [
-        os.path.join(CONNECTORS_DIR, "tap-postgres"),
-        os.path.join(CONNECTORS_DIR, "tap-mysql"),
-        os.path.join(CONNECTORS_DIR, "tap-mongodb"),
-    ]
-    existing = os.environ.get("PYTHONPATH", "")
-    return os.pathsep.join([*connector_paths, existing] if existing else connector_paths)
-
-
-def _tap_command(source_type: str) -> List[str]:
-    """DEPRECATED: Use orchestration.discovery.run_discovery via Meltano. Kept as fallback."""
-    source_type = ensure_supported_source(source_type)
-    if source_type == "postgresql":
-        return [sys.executable, "-c", "import tap_postgres; tap_postgres.main()"]
-    if source_type == "mysql":
-        return [sys.executable, "-m", "tap_mysql"]
-    if source_type == "mongodb":
-        return [sys.executable, "-c", "import tap_mongodb; tap_mongodb.main()"]
-    raise ValueError(f"Unsupported source type: {source_type}")
-
-
-def _catalog_arg_name(source_type: str) -> str:
-    return "--properties" if source_type == "postgresql" else "--catalog"
-
-
-def _tap_env() -> Dict[str, str]:
-    """Build environment for Singer tap subprocesses."""
-    env = os.environ.copy()
-    env["PYTHONPATH"] = _tap_pythonpath()
-    # Ensure subprocesses can verify TLS certificates (fixes macOS CA issue).
-    env.setdefault("SSL_CERT_FILE", certifi.where())
-    env.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
-    return env
-
-
-def _run_discovery_sync(source_type: str, singer_config: Dict[str, Any]) -> Dict[str, Any]:
-    """DEPRECATED: Use orchestration.discovery.run_discovery. Kept as fallback when Meltano unavailable."""
-    env = _tap_env()
-
-    with temporary_json_file(singer_config) as config_path:
-        command = [*_tap_command(source_type), "--config", config_path, "--discover"]
-        output = run_command(command, env=env, timeout_seconds=TAP_TIMEOUT_SECONDS)
-        return parse_discovery_output(output)
-
-
-def _run_collect_sync(
-    source_type: str,
-    singer_config: Dict[str, Any],
-    selected_catalog: Dict[str, Any],
-    state: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    env = _tap_env()
-
-    with temporary_json_file(singer_config) as config_path, temporary_json_file(selected_catalog) as catalog_path:
-        command = [*_tap_command(source_type), "--config", config_path, _catalog_arg_name(source_type), catalog_path]
-        if state:
-            with temporary_json_file(state) as state_path:
-                command.extend(["--state", state_path])
-                output = run_command(command, env=env, timeout_seconds=TAP_TIMEOUT_SECONDS)
-        else:
-            output = run_command(command, env=env, timeout_seconds=TAP_TIMEOUT_SECONDS)
-
-    records, new_state = parse_singer_stream(output)
-    return {"records": records, "state": new_state}
-
-
-def _infer_sql_type(value: Any):
-    if isinstance(value, bool):
-        return Boolean
-    if isinstance(value, int):
-        return BigInteger
-    if isinstance(value, float):
-        return Float
-    if isinstance(value, (dict, list)):
-        return JSON
-    return Text
-
-
-def _sanitize_record_for_sql(record: Dict[str, Any], json_columns: set) -> Dict[str, Any]:
-    """Coerce MongoDB-style record values so PostgreSQL / MySQL can accept them.
-
-    * dict/list values destined for a non-JSON column are serialised to JSON strings.
-    * dict/list values for JSON columns are left as-is (SQLAlchemy handles them).
-    * ``decimal.Decimal`` is converted to ``float`` for broad driver compatibility.
-    """
-    import decimal
-
-    cleaned: Dict[str, Any] = {}
-    for key, value in record.items():
-        if isinstance(value, (dict, list)):
-            if key in json_columns:
-                cleaned[key] = value
-            else:
-                cleaned[key] = json.dumps(value, default=str)
-        elif isinstance(value, decimal.Decimal):
-            cleaned[key] = float(value)
-        else:
-            cleaned[key] = value
-    return cleaned
-
-
-# Fixed namespace for deterministic ObjectId → UUID conversion.
-# Every MongoDB _id always maps to the same UUID.
-_MONGO_OID_NS = uuid.UUID("a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d")
-
-
-def _objectid_to_uuid(oid: str) -> str:
-    """Convert a MongoDB ObjectId hex string to a deterministic UUID v5."""
-    return str(uuid.uuid5(_MONGO_OID_NS, oid))
-
-
-def _mongo_id_to_uuid(value: Any) -> str:
-    """Convert any MongoDB _id to a deterministic UUID for Postgres migration.
-    Handles: ObjectId hex (24 chars), string IDs (e.g. 'cust_1'), int, etc.
-    """
-    if value is None:
-        return str(uuid.uuid4())
-    if isinstance(value, str):
-        if len(value) == 24:
-            try:
-                int(value, 16)
-                return _objectid_to_uuid(value)
-            except ValueError:
-                pass
-        return str(uuid.uuid5(_MONGO_OID_NS, value))
-    # ObjectId, int, or other: use string representation for deterministic UUID
-    return str(uuid.uuid5(_MONGO_OID_NS, str(value)))
-
-
-def _is_uuid_column(col) -> bool:
-    """Check whether a SQLAlchemy column is a UUID / GUID type."""
-    from sqlalchemy.dialects.postgresql import UUID as PG_UUID
-
-    col_type = col.type
-    type_str = str(col_type).upper()
-    if isinstance(col_type, PG_UUID):
-        return True
-    return type_str in ("UUID", "GUID")
-
-
-def _build_sqlalchemy_url(dest_type: str, connection_config: Dict[str, Any]) -> str:
-    if connection_config.get("connection_string"):
-        return str(connection_config["connection_string"])
-
-    user = connection_config.get("username") or connection_config.get("user")
-    password = connection_config.get("password")
-    host = connection_config.get("host", "localhost")
-    port = connection_config.get("port")
-    database = connection_config.get("database") or connection_config.get("dbname")
-
-    if not database:
-        raise ValueError("Destination database is required")
-
-    user_part = quote_plus(str(user)) if user else ""
-    password_part = quote_plus(str(password)) if password else ""
-    auth_part = ""
-    if user_part:
-        auth_part = user_part
-        if password is not None:
-            auth_part += f":{password_part}"
-        auth_part += "@"
-
-    if dest_type == "postgresql":
-        driver = "postgresql+psycopg2"
-        default_port = 5432
-    elif dest_type == "mysql":
-        driver = "mysql+pymysql"
-        default_port = 3306
-    else:
-        raise ValueError(f"Unsupported SQL destination: {dest_type}")
-
-    resolved_port = int(port or default_port)
-    return f"{driver}://{auth_part}{host}:{resolved_port}/{database}"
-
-
-def _prepare_sql_table(
-    engine,
-    dest_type: str,
-    table_name: str,
-    schema_name: Optional[str],
-    records: List[Dict[str, Any]],
-    upsert_keys: List[str],
-) -> Table:
-    if not records:
-        raise ValueError("No records available to prepare destination table")
-
-    metadata = MetaData()
-    inspector = inspect(engine)
-    has_table = inspector.has_table(table_name, schema=schema_name if dest_type == "postgresql" else None)
-
-    if not has_table:
-        # Scan ALL records (not just the first) to pick the most appropriate
-        # SQL type for each column.  A dict/list anywhere promotes to JSON;
-        # a float anywhere promotes BigInteger → Float, etc.
-        column_types: Dict[str, Any] = {}
-        all_keys: List[str] = []
-        seen_keys: set = set()
-        for rec in records:
-            for key, value in rec.items():
-                if not isinstance(key, str):
-                    continue
-                if key not in seen_keys:
-                    all_keys.append(key)
-                    seen_keys.add(key)
-                inferred = _infer_sql_type(value)
-                existing = column_types.get(key)
-                if existing is None:
-                    column_types[key] = inferred
-                elif existing is not inferred:
-                    # Widen: any conflict → Text (safest), but keep JSON if either is JSON.
-                    if inferred is JSON or existing is JSON:
-                        column_types[key] = JSON
-                    else:
-                        column_types[key] = Text
-
-        columns: List[Column] = []
-        for key in all_keys:
-            nullable = key not in upsert_keys
-            columns.append(
-                Column(
-                    key,
-                    column_types[key],
-                    primary_key=key in upsert_keys,
-                    nullable=nullable,
-                )
-            )
-        if not columns:
-            raise ValueError("Could not infer destination columns from records")
-        table = Table(
-            table_name,
-            metadata,
-            *columns,
-            schema=schema_name if dest_type == "postgresql" else None,
-        )
-        metadata.create_all(engine, tables=[table])
-        return table
-
-    return Table(
-        table_name,
-        metadata,
-        autoload_with=engine,
-        schema=schema_name if dest_type == "postgresql" else None,
-    )
-
-
-def _emit_to_sql(
-    dest_type: str,
-    connection_config: Dict[str, Any],
-    table_name: str,
-    schema_name: Optional[str],
-    write_mode: str,
-    upsert_keys: List[str],
-    records: List[Dict[str, Any]],
-) -> EmitResponse:
-    if not records:
-        return EmitResponse(rows_written=0, rows_skipped=0, rows_failed=0, errors=[])
-
-    # Pre-normalise field names before table creation so auto-created tables
-    # get ``id`` instead of ``_id`` and don't include ``_stream``.
-    for rec in records:
-        rec.pop("_stream", None)
-        if "_id" in rec and "id" not in rec:
-            rec["id"] = rec.pop("_id")
-
-    engine = create_engine(_build_sqlalchemy_url(dest_type, connection_config), future=True, pool_pre_ping=True)
-    table = _prepare_sql_table(engine, dest_type, table_name, schema_name, records, upsert_keys)
-    table_columns = {column.name for column in table.columns}
-
-    # Build a set of column names whose SQL type is JSON so the sanitiser
-    # knows which values it can pass as dicts/lists.
-    json_columns: set = set()
-    for col in table.columns:
-        if isinstance(col.type, JSON):
-            json_columns.add(col.name)
-
-    # Convert ObjectId strings to deterministic UUIDs when the ``id`` column
-    # is UUID typed (common in pre-existing PostgreSQL tables).
-    id_is_uuid = False
-    for col in table.columns:
-        if col.name == "id" and _is_uuid_column(col):
-            id_is_uuid = True
-            break
-
-    if id_is_uuid:
-        for rec in records:
-            raw_id = rec.get("id")
-            if raw_id is None or raw_id == "":
-                rec["id"] = str(uuid.uuid5(_MONGO_OID_NS, json.dumps(rec, sort_keys=True, default=str)))
-            else:
-                # Convert any MongoDB _id (ObjectId hex, string, int, etc.) to UUID
-                rec["id"] = _mongo_id_to_uuid(raw_id)
-
-    rows_written = 0
-    rows_failed = 0
-    rows_skipped = 0
-    errors: List[Dict[str, Any]] = []
-
-    filtered_records = []
-    for item in records:
-        cleaned = {key: value for key, value in item.items() if key in table_columns}
-        if cleaned:
-            filtered_records.append(_sanitize_record_for_sql(cleaned, json_columns))
-        else:
-            rows_skipped += 1
-
-    with engine.begin() as conn:
-        if write_mode == "replace":
-            if dest_type == "postgresql":
-                schema = schema_name or "public"
-                conn.execute(text(f'TRUNCATE TABLE "{schema}"."{table_name}" RESTART IDENTITY'))
-            else:
-                conn.execute(text(f"DELETE FROM `{table_name}`"))
-
-        for batch in chunked(filtered_records, EMIT_CHUNK_SIZE):
-            if not batch:
-                continue
-            try:
-                if write_mode == "upsert":
-                    if not upsert_keys:
-                        raise ValueError("write_mode=upsert requires `upsert_key`")
-                    if dest_type == "postgresql":
-                        insert_stmt = pg_insert(table).values(batch)
-                        update_columns = {
-                            column.name: insert_stmt.excluded[column.name]
-                            for column in table.columns
-                            if column.name not in upsert_keys
-                        }
-                        if not update_columns:
-                            update_columns = {upsert_keys[0]: insert_stmt.excluded[upsert_keys[0]]}
-                        stmt = insert_stmt.on_conflict_do_update(index_elements=upsert_keys, set_=update_columns)
-                        conn.execute(stmt)
-                    else:
-                        insert_stmt = mysql_insert(table).values(batch)
-                        update_columns = {
-                            column.name: insert_stmt.inserted[column.name]
-                            for column in table.columns
-                            if column.name not in upsert_keys
-                        }
-                        if not update_columns:
-                            update_columns = {upsert_keys[0]: insert_stmt.inserted[upsert_keys[0]]}
-                        stmt = insert_stmt.on_duplicate_key_update(**update_columns)
-                        conn.execute(stmt)
-                else:
-                    conn.execute(table.insert(), batch)
-
-                rows_written += len(batch)
-            except Exception as exc:  # pragma: no cover - database-specific failures
-                etl_log.error("Emit batch failed: %s", exc, exc_info=True)
-                rows_failed += len(batch)
-                errors.append({"error": str(exc), "batch_size": len(batch)})
-
-    engine.dispose()
-    return EmitResponse(
-        rows_written=rows_written,
-        rows_skipped=rows_skipped,
-        rows_failed=rows_failed,
-        errors=errors,
-    )
-
-
-def _emit_to_mongodb(
-    connection_config: Dict[str, Any],
-    table_name: str,
-    write_mode: str,
-    upsert_keys: List[str],
-    records: List[Dict[str, Any]],
-) -> EmitResponse:
-    connection_uri = connection_config.get("connection_string_mongo") or connection_config.get("connection_string")
-    if not connection_uri:
-        host = connection_config.get("host", "localhost")
-        port = int(connection_config.get("port", 27017))
-        db_name = connection_config.get("database") or connection_config.get("dbname")
-        if not db_name:
-            raise ValueError("MongoDB database is required")
-        user = connection_config.get("username") or connection_config.get("user")
-        password = connection_config.get("password")
-        if user and password:
-            connection_uri = f"mongodb://{quote_plus(str(user))}:{quote_plus(str(password))}@{host}:{port}/{db_name}"
-        else:
-            connection_uri = f"mongodb://{host}:{port}/{db_name}"
-
-    database_name = connection_config.get("database") or connection_config.get("dbname")
-    if not database_name:
-        raise ValueError("MongoDB database is required")
-
-    client = MongoClient(connection_uri, **_mongo_client_kwargs(connection_uri))
-    collection = client[database_name][table_name]
-    rows_written = 0
-    rows_failed = 0
-    errors: List[Dict[str, Any]] = []
-
-    try:
-        if write_mode == "replace":
-            collection.delete_many({})
-
-        if write_mode == "upsert":
-            if not upsert_keys:
-                upsert_keys = ["_id"]
-            operations = []
-            for record in records:
-                filter_doc = {key: record.get(key) for key in upsert_keys}
-                operations.append(UpdateOne(filter_doc, {"$set": record}, upsert=True))
-            if operations:
-                result = collection.bulk_write(operations, ordered=False)
-                rows_written = result.upserted_count + result.modified_count + result.matched_count
-        else:
-            if records:
-                result = collection.insert_many(records, ordered=False)
-                rows_written = len(result.inserted_ids)
-    except Exception as exc:  # pragma: no cover - database-specific failures
-        rows_failed = len(records)
-        errors.append({"error": str(exc)})
-    finally:
-        client.close()
-
-    return EmitResponse(
-        rows_written=rows_written,
-        rows_skipped=0,
-        rows_failed=rows_failed,
-        errors=errors,
-    )
-
-
 @app.get("/")
 async def root() -> Dict[str, str]:
     return {"service": APP_NAME, "version": APP_VERSION, "status": "ok"}
@@ -711,61 +259,44 @@ async def health() -> Dict[str, str]:
     return {"status": "healthy"}
 
 
-def _run_discovery_source_type(source_type: str, singer_config: Dict[str, Any]) -> Dict[str, Any]:
-    """Legacy discovery via direct tap execution. Kept as fallback when Meltano is unavailable."""
-    return _run_discovery_sync(source_type, singer_config)
-
-
 @app.post("/discover-schema/{source_type}", response_model=DiscoverSchemaResponse)
 async def discover_schema(
     source_type: str,
     payload: DiscoverSchemaRequest,
     _token: str = Depends(_require_jwt),
 ) -> DiscoverSchemaResponse:
+    """Schema discovery via Meltano invoke. No legacy fallback."""
     normalized_source = ensure_supported_source(source_type)
     activity("datasource.schema_discovered", f"Discovering schema for {normalized_source}", source_type=normalized_source, metadata={
         "table_name": payload.table_name, "schema_name": payload.schema_name,
     })
 
-    singer_config = build_singer_config(
-        normalized_source,
-        payload.connection_config,
-        {
-            **payload.source_config,
-            **({"table": payload.table_name} if payload.table_name else {}),
-            **({"schema": payload.schema_name} if payload.schema_name else {}),
-            **({"query": payload.query} if payload.query else {}),
-        },
-    )
+    source_config = {
+        **payload.source_config,
+        **({"table": payload.table_name} if payload.table_name else {}),
+        **({"schema": payload.schema_name} if payload.schema_name else {}),
+        **({"query": payload.query} if payload.query else {}),
+    }
 
-    use_meltano = os.getenv("USE_MELTANO_DISCOVERY", "true").lower() in ("true", "1", "yes")
-    catalog = None
-
-    if use_meltano:
-        try:
-            catalog = await run_discovery(
-                normalized_source,
-                payload.connection_config,
-                timeout_seconds=TAP_TIMEOUT_SECONDS,
-            )
-        except (RuntimeError, Exception) as exc:
-            etl_log.warning("Meltano discovery failed, falling back to legacy: %s", exc)
-            catalog = None
-
-    if catalog is None:
-        try:
-            catalog = await asyncio.to_thread(_run_discovery_source_type, normalized_source, singer_config)
-        except ETLRuntimeError as exc:
-            mysql_auth_error = _humanize_mysql_auth_error(str(exc))
-            if mysql_auth_error:
-                activity("request.error", f"Schema discovery failed: {mysql_auth_error}", level="error", source_type=normalized_source)
-                raise HTTPException(status_code=400, detail=mysql_auth_error) from exc
-            activity("request.error", f"Singer discovery failed: {exc}", level="error", source_type=normalized_source)
-            raise HTTPException(status_code=502, detail=f"Singer discovery failed: {exc}") from exc
-        except Exception as exc:
-            msg = str(exc) or "Schema discovery failed"
-            activity("request.error", msg, level="error", source_type=normalized_source)
-            raise HTTPException(status_code=502, detail=msg) from exc
+    try:
+        catalog = await run_discovery(
+            normalized_source,
+            payload.connection_config,
+            source_config=source_config if any(v is not None for v in source_config.values()) else None,
+            timeout_seconds=TAP_TIMEOUT_SECONDS,
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        mysql_auth_error = _humanize_mysql_auth_error(msg)
+        if mysql_auth_error:
+            activity("request.error", f"Schema discovery failed: {mysql_auth_error}", level="error", source_type=normalized_source)
+            raise HTTPException(status_code=400, detail=mysql_auth_error) from exc
+        activity("request.error", f"Meltano discovery failed: {msg}", level="error", source_type=normalized_source)
+        raise HTTPException(status_code=502, detail=msg or "Schema discovery failed") from exc
+    except Exception as exc:
+        msg = str(exc) or "Schema discovery failed"
+        activity("request.error", msg, level="error", source_type=normalized_source)
+        raise HTTPException(status_code=502, detail=msg) from exc
 
     schema = extract_schema(catalog, table_name=payload.table_name, schema_name=payload.schema_name)
     activity("datasource.schema_discovered", f"Schema discovered: {len(schema['columns'])} columns", source_type=normalized_source, metadata={
@@ -785,11 +316,12 @@ async def collect(
     payload: CollectRequest,
     _token: str = Depends(_require_jwt),
 ) -> CollectResponse:
+    """Collect data via Meltano invoke. No legacy fallback."""
     normalized_source = ensure_supported_source(source_type)
     activity("sync.collect", f"Collecting from {normalized_source}", source_type=normalized_source, metadata={
         "sync_mode": payload.sync_mode, "table_name": payload.table_name, "limit": payload.limit, "offset": payload.offset,
     })
-    singer_config = build_singer_config(
+    tap_config = connection_config_to_tap_config(
         normalized_source,
         payload.connection_config,
         {
@@ -800,70 +332,47 @@ async def collect(
         },
     )
 
-    use_meltano_collect = os.getenv("USE_MELTANO_COLLECT", "false").lower() in ("true", "1", "yes")
-    collect_result = None
-
-    if use_meltano_collect:
-        try:
-            discovery_catalog = await run_discovery(
-                normalized_source,
-                payload.connection_config,
-                timeout_seconds=TAP_TIMEOUT_SECONDS,
-            )
-            selected_catalog, _selected_streams = select_catalog_streams(
-                normalized_source,
-                discovery_catalog,
-                table_name=payload.table_name,
-                schema_name=payload.schema_name,
-                sync_mode=payload.sync_mode,
-                replication_key=payload.replication_key,
-            )
-            collect_result = await run_collect_via_meltano(
-                normalized_source,
-                payload.connection_config,
-                selected_catalog,
-                state=payload.checkpoint,
-                singer_config=singer_config,
-                timeout_seconds=TAP_TIMEOUT_SECONDS,
-            )
-        except (RuntimeError, Exception) as exc:
-            etl_log.warning("Meltano collect failed, falling back to legacy: %s", exc)
-            collect_result = None
-
-    if collect_result is None:
-        try:
-            discovery_catalog = await asyncio.to_thread(_run_discovery_sync, normalized_source, singer_config)
-            selected_catalog, _selected_streams = select_catalog_streams(
-                normalized_source,
-                discovery_catalog,
-                table_name=payload.table_name,
-                schema_name=payload.schema_name,
-                sync_mode=payload.sync_mode,
-                replication_key=payload.replication_key,
-            )
-            collect_result = await asyncio.to_thread(
-                _run_collect_sync,
-                normalized_source,
-                singer_config,
-                selected_catalog,
-                payload.checkpoint,
-            )
-        except ETLRuntimeError as exc:
-            error_msg = str(exc)
-            activity("request.error", f"Singer collect failed for {normalized_source}: {error_msg[:500]}", level="error", source_type=normalized_source, metadata={
-                "table_name": payload.table_name, "sync_mode": payload.sync_mode,
-            })
-            mysql_auth_error = _humanize_mysql_auth_error(error_msg)
-            if mysql_auth_error:
-                raise HTTPException(status_code=400, detail=mysql_auth_error) from exc
-            raise HTTPException(status_code=502, detail=f"Singer collect failed: {error_msg[:2000]}") from exc
-        except ValueError as exc:
-            activity("request.error", f"Collect validation error: {exc}", level="warn", source_type=normalized_source)
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:
-            error_msg = str(exc)
-            activity("request.error", f"Unexpected collect error for {normalized_source}: {error_msg[:500]}", level="error", source_type=normalized_source)
-            raise HTTPException(status_code=500, detail=f"Internal collect error: {error_msg[:2000]}") from exc
+    try:
+        discovery_catalog = await run_discovery(
+            normalized_source,
+            payload.connection_config,
+            source_config={
+                "table": payload.table_name,
+                "schema": payload.schema_name,
+            } if payload.table_name or payload.schema_name else None,
+            timeout_seconds=TAP_TIMEOUT_SECONDS,
+        )
+        selected_catalog, _ = select_catalog_streams(
+            normalized_source,
+            discovery_catalog,
+            table_name=payload.table_name,
+            schema_name=payload.schema_name,
+            sync_mode=payload.sync_mode,
+            replication_key=payload.replication_key,
+        )
+        collect_result = await run_collect_via_meltano(
+            normalized_source,
+            payload.connection_config,
+            selected_catalog,
+            state=payload.checkpoint,
+            tap_config=tap_config,
+            timeout_seconds=TAP_TIMEOUT_SECONDS,
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        mysql_auth_error = _humanize_mysql_auth_error(msg)
+        if mysql_auth_error:
+            activity("request.error", f"Collect failed: {mysql_auth_error}", level="error", source_type=normalized_source)
+            raise HTTPException(status_code=400, detail=mysql_auth_error) from exc
+        activity("request.error", f"Meltano collect failed: {msg}", level="error", source_type=normalized_source)
+        raise HTTPException(status_code=502, detail=msg or "Collect failed") from exc
+    except ValueError as exc:
+        activity("request.error", f"Collect validation error: {exc}", level="warn", source_type=normalized_source)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        msg = str(exc)
+        activity("request.error", f"Unexpected collect error for {normalized_source}: {msg[:500]}", level="error", source_type=normalized_source)
+        raise HTTPException(status_code=502, detail=msg or "Collect failed") from exc
 
     all_records = collect_result["records"]
     total_rows = len(all_records)
@@ -891,138 +400,28 @@ async def collect(
     )
 
 
-@app.post("/transform", response_model=TransformResponse)
+@app.post("/transform")
 async def transform(
     payload: TransformRequest,
     _token: str = Depends(_require_jwt),
-) -> TransformResponse:
-    validation = validate_transform_script(payload.transform_script)
-    if not validation.get("valid", False):
-        activity("request.error", f"Invalid transform script: {validation.get('error')}", level="warn")
-        raise HTTPException(status_code=400, detail=validation.get("error", "Invalid transform script"))
-
-    records = payload.get_records()
-    activity("sync.transform", f"Transforming {len(records)} rows", metadata={"input_rows": len(records)})
-    result = safe_exec_transform(records, payload.transform_script)
-    activity("sync.transform", f"Transformed: {len(result['transformed_rows'])} rows, {len(result['errors'])} errors", metadata={
-        "output_rows": len(result["transformed_rows"]), "error_count": len(result["errors"]),
-    })
-    return TransformResponse(
-        transformed_rows=result["transformed_rows"],
-        errors=result["errors"],
+):
+    """Deprecated. Use POST /run-meltano-pipeline with dbt for transformations."""
+    raise HTTPException(
+        status_code=410,
+        detail="Transform endpoint deprecated. Use POST /run-meltano-pipeline with dbt for transformations.",
     )
 
 
-@app.post("/emit/{dest_type}", response_model=EmitResponse)
+@app.post("/emit/{dest_type}")
 async def emit(
     dest_type: str,
     payload: EmitRequest,
     _token: str = Depends(_require_jwt),
-) -> EmitResponse:
-    normalized_dest = ensure_supported_source(dest_type)
-    records = payload.get_records()
-    activity("sync.emit", f"Emitting {len(records)} rows to {normalized_dest}", source_type=normalized_dest, metadata={
-        "row_count": len(records), "write_mode": payload.write_mode, "table": payload.table_name,
-    })
-
-    if normalized_dest in {"postgresql", "mysql"}:
-        try:
-            return _emit_to_sql(
-                normalized_dest,
-                payload.connection_config,
-                payload.table_name,
-                payload.schema_name,
-                payload.write_mode,
-                payload.upsert_key or [],
-                records,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:  # pragma: no cover - database-specific failures
-            raise HTTPException(status_code=500, detail=f"Emit failed: {exc}") from exc
-
-    if normalized_dest == "mongodb":
-        try:
-            return _emit_to_mongodb(
-                payload.connection_config,
-                payload.table_name,
-                payload.write_mode,
-                payload.upsert_key or [],
-                records,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:  # pragma: no cover - database-specific failures
-            raise HTTPException(status_code=500, detail=f"Emit failed: {exc}") from exc
-
-    raise HTTPException(status_code=400, detail=f"Unsupported destination type: {dest_type}")
-
-
-def _run_meltano_pipeline_legacy(
-    payload: RunMeltanoPipelineRequest,
-    source_type: str,
-    dest_type: str,
-    dest_table: str,
-) -> RunMeltanoPipelineResponse:
-    """Legacy path: manual collect + transform + emit. Used when no Meltano job or single-table sync."""
-    singer_config = build_singer_config(
-        source_type,
-        payload.source_connection_config,
-        {"table": payload.source_table, "schema": payload.source_schema},
-    )
-    discovery_catalog = _run_discovery_sync(source_type, singer_config)
-    schema_filter = None if source_type == "mongodb" else payload.source_schema
-    selected_catalog, _ = select_catalog_streams(
-        source_type,
-        discovery_catalog,
-        table_name=payload.source_table,
-        schema_name=schema_filter,
-        sync_mode=payload.sync_mode,
-        replication_key=payload.replication_key,
-    )
-    collect_result = _run_collect_sync(
-        source_type, singer_config, selected_catalog, payload.checkpoint
-    )
-    records = collect_result["records"]
-    if payload.limit:
-        records = records[: payload.limit]
-    rows_read = len(records)
-    if rows_read == 0:
-        return RunMeltanoPipelineResponse(
-            rows_read=0,
-            rows_written=0,
-            rows_skipped=0,
-            rows_failed=0,
-            checkpoint=merge_state(payload.checkpoint, collect_result["state"]),
-        )
-    if payload.transform_script:
-        validation = validate_transform_script(payload.transform_script)
-        if not validation.get("valid", False):
-            raise HTTPException(status_code=400, detail=validation.get("error", "Invalid transform script"))
-        transform_result = safe_exec_transform(records, payload.transform_script)
-        records = transform_result["transformed_rows"]
-    upsert_keys = payload.upsert_key or []
-    if dest_type == "mongodb":
-        emit_result = _emit_to_mongodb(
-            payload.dest_connection_config, dest_table, payload.write_mode, upsert_keys, records
-        )
-    else:
-        emit_result = _emit_to_sql(
-            dest_type,
-            payload.dest_connection_config,
-            dest_table,
-            payload.dest_schema,
-            payload.write_mode,
-            upsert_keys,
-            records,
-        )
-    return RunMeltanoPipelineResponse(
-        rows_read=rows_read,
-        rows_written=emit_result.rows_written,
-        rows_skipped=emit_result.rows_skipped,
-        rows_failed=emit_result.rows_failed,
-        checkpoint=merge_state(payload.checkpoint, collect_result["state"]),
-        errors=emit_result.errors or [],
+):
+    """Deprecated. Use POST /run-meltano-pipeline for data movement via Meltano loaders."""
+    raise HTTPException(
+        status_code=410,
+        detail="Emit endpoint deprecated. Use POST /run-meltano-pipeline for data movement.",
     )
 
 
@@ -1032,9 +431,7 @@ async def run_meltano_pipeline(
     _token: str = Depends(_require_jwt),
 ) -> RunMeltanoPipelineResponse:
     """
-    Run a Meltano-style pipeline with **dynamic connections** from the database.
-    Uses Meltano when a job exists (mongodb-to-postgres); falls back to legacy for
-    postgres-to-mongodb or when single-table sync or transform_script is requested.
+    Run a Meltano pipeline with dynamic connections. Clean Engine: Meltano only, no legacy fallback.
     """
     direction = payload.direction
     if direction == "postgres-to-mongodb":
@@ -1044,38 +441,29 @@ async def run_meltano_pipeline(
         source_type = "mongodb"
         dest_type = "postgresql"
 
-    dest_table = payload.dest_table or payload.source_table
-    if not dest_table:
-        raise HTTPException(status_code=400, detail="source_table or dest_table is required")
+    job_name = get_job_for_direction(source_type, dest_type)
+    if job_name is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No Meltano job for direction {direction}. Add a job in meltano.yml for {source_type}→{dest_type}.",
+        )
+    if payload.source_table is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Single-table sync (source_table) is not supported in Clean Engine. Use full pipeline.",
+        )
+    if payload.transform_script is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="transform_script is not supported in Clean Engine. Use dbt in the Meltano job.",
+        )
 
     activity(
         "sync.meltano_pipeline",
-        f"Running {direction}: collect from {source_type} -> emit to {dest_type}",
+        f"Running {direction}: {source_type} -> {dest_type}",
         source_type=source_type,
-        metadata={"source_table": payload.source_table, "dest_table": dest_table},
+        metadata={"job": job_name},
     )
-
-    use_meltano = os.getenv("USE_MELTANO_PIPELINE", "true").lower() in ("true", "1", "yes")
-    job_name = get_job_for_direction(source_type, dest_type)
-    use_legacy = (
-        not use_meltano
-        or job_name is None
-        or payload.source_table is not None
-        or payload.transform_script is not None
-    )
-
-    if use_legacy:
-        try:
-            return await asyncio.to_thread(
-                _run_meltano_pipeline_legacy,
-                payload,
-                source_type,
-                dest_type,
-                dest_table,
-            )
-        except ETLRuntimeError as exc:
-            activity("request.error", f"Pipeline collect failed: {exc}", level="error", source_type=source_type)
-            raise HTTPException(status_code=502, detail=f"Collection failed: {exc}") from exc
 
     try:
         result = await run_pipeline_job(
@@ -1089,17 +477,9 @@ async def run_meltano_pipeline(
             timeout_seconds=TAP_TIMEOUT_SECONDS,
         )
     except Exception as exc:
-        etl_log.warning("Meltano pipeline failed, falling back to legacy: %s", exc)
-        try:
-            return await asyncio.to_thread(
-                _run_meltano_pipeline_legacy,
-                payload,
-                source_type,
-                dest_type,
-                dest_table,
-            )
-        except ETLRuntimeError as legacy_exc:
-            raise HTTPException(status_code=502, detail=f"Collection failed: {legacy_exc}") from legacy_exc
+        msg = str(exc)
+        activity("request.error", f"Meltano pipeline failed: {msg}", level="error", source_type=source_type)
+        raise HTTPException(status_code=502, detail=msg or "Pipeline failed") from exc
 
     if not result.success:
         detail = result.user_message or (result.errors[0]["error"] if result.errors else "Pipeline failed")
@@ -1150,36 +530,18 @@ async def test_connection(
     payload: TestConnectionRequest,
     _token: str = Depends(_require_jwt),
 ) -> TestConnectionResponse:
+    """Test connection via Meltano discovery. No direct DB access."""
     source_type = ensure_supported_source(payload.type)
     activity("datasource.connection_tested", f"Testing connection for {source_type}", source_type=source_type)
     config = payload.model_dump(exclude_none=True)
-
-    if source_type == "mongodb":
-        uri = config.get("connection_string_mongo") or config.get("connection_string")
-        if not uri:
-            host = config.get("host", "localhost")
-            port = int(config.get("port", 27017))
-            db_name = config.get("database", "admin")
-            user = config.get("username") or config.get("user")
-            password = config.get("password")
-            if user and password:
-                uri = f"mongodb://{quote_plus(str(user))}:{quote_plus(str(password))}@{host}:{port}/{db_name}"
-            else:
-                uri = f"mongodb://{host}:{port}/{db_name}"
-        try:
-            client = MongoClient(uri, serverSelectionTimeoutMS=5000, **_mongo_client_kwargs(uri))
-            client.admin.command("ping")
-            client.close()
-            return TestConnectionResponse(success=True, message="MongoDB connection successful")
-        except Exception as exc:
-            return TestConnectionResponse(success=False, error=str(exc))
+    connection_config = {k: v for k, v in config.items() if k != "type"}
 
     try:
-        url = _build_sqlalchemy_url(source_type, config)
-        engine = create_engine(url, future=True, pool_pre_ping=True)
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        engine.dispose()
+        await run_discovery(
+            source_type,
+            connection_config,
+            timeout_seconds=10,
+        )
         return TestConnectionResponse(success=True, message="Connection successful")
     except Exception as exc:
         return TestConnectionResponse(success=False, error=str(exc))

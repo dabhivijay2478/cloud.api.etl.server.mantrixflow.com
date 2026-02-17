@@ -1,15 +1,39 @@
-"""Map generic connection_config to Meltano environment variables.
+"""Map generic connection_config to Meltano environment variables and tap config.
 
-Reuses logic from utils.build_singer_config for consistency.
 Meltano env format: MELTANO_EXTRACTOR_<PLUGIN>_<SETTING> (e.g. MELTANO_EXTRACTOR_TAP_POSTGRES_SQLALCHEMY_URL)
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Literal
-from urllib.parse import quote_plus, urlparse
+from typing import Any, Dict, Literal, Optional
+from urllib.parse import parse_qs, quote_plus, unquote_plus, urlparse
 
-from utils import _parse_mongo_uri, ensure_supported_source
+from utils import ensure_supported_source
+
+
+def _parse_mongo_uri(uri: str) -> Dict[str, Any]:
+    """Parse a MongoDB connection string into individual config fields for Singer tap.
+
+    Handles both ``mongodb://`` and ``mongodb+srv://`` schemes using stdlib only.
+    """
+    parsed_url = urlparse(uri)
+    result: Dict[str, Any] = {
+        "host": parsed_url.hostname or "localhost",
+        "port": parsed_url.port or 27017,
+        "user": unquote_plus(parsed_url.username or ""),
+        "password": unquote_plus(parsed_url.password or ""),
+        "database": (parsed_url.path.lstrip("/") or "admin"),
+        "ssl": "true" if uri.startswith("mongodb+srv://") else "false",
+    }
+    if parsed_url.query:
+        opts = parse_qs(parsed_url.query)
+        if opts.get("replicaSet"):
+            result["replica_set"] = opts["replicaSet"][0]
+        if opts.get("authSource"):
+            result["auth_source"] = opts["authSource"][0]
+    if uri.startswith("mongodb+srv://"):
+        result["verify_mode"] = "false"
+    return result
 
 Role = Literal["extractor", "loader"]
 
@@ -129,6 +153,23 @@ def _connection_config_to_extractor_config(
         return _build_mongodb_connection_config(conn)
 
     raise ValueError(f"Unsupported source type: {source_type}")
+
+
+def connection_config_to_tap_config(
+    source_type: str,
+    connection_config: Dict[str, Any],
+    source_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build tap config for --config file (e.g. collect invoke).
+
+    Merges connection config with source_config overrides (table, schema, query).
+    """
+    config = _connection_config_to_extractor_config(source_type, connection_config)
+    if source_config:
+        for key, value in source_config.items():
+            if value is not None:
+                config[key] = value
+    return config
 
 
 def _connection_config_to_loader_config(

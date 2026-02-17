@@ -5,15 +5,9 @@ from __future__ import annotations
 import copy
 import json
 import os
-import subprocess
 import tempfile
 from contextlib import contextmanager
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import unquote_plus, urlparse
-
-
-class ETLRuntimeError(RuntimeError):
-    """Raised when a tap execution fails."""
+from typing import Any, Dict, List, Optional, Tuple
 
 
 SUPPORTED_SOURCES = {"postgresql", "mysql", "mongodb"}
@@ -39,145 +33,6 @@ def ensure_supported_source(source_type: str) -> str:
     return normalized
 
 
-def _parse_mongo_uri(uri: str) -> Dict[str, Any]:
-    """Parse a MongoDB connection string into individual config fields for Singer tap.
-
-    Handles both ``mongodb://`` and ``mongodb+srv://`` schemes.  For SRV URIs
-    the DNS SRV lookup is delegated to pymongo so we get the real shard hosts.
-    """
-    try:
-        from pymongo.uri_parser import parse_uri  # pymongo is already a dependency
-        parsed = parse_uri(uri)
-    except Exception:
-        # Fallback: basic urllib parsing when pymongo SRV resolution fails.
-        parsed_url = urlparse(uri)
-        return {
-            "host": parsed_url.hostname or "localhost",
-            "port": parsed_url.port or 27017,
-            "user": unquote_plus(parsed_url.username or ""),
-            "password": unquote_plus(parsed_url.password or ""),
-            "database": (parsed_url.path.lstrip("/") or "admin"),
-            "ssl": "true" if uri.startswith("mongodb+srv://") else "false",
-        }
-
-    nodelist = parsed.get("nodelist") or [("localhost", 27017)]
-    host = nodelist[0][0]
-    port = nodelist[0][1] or 27017
-
-    result: Dict[str, Any] = {
-        "host": host,
-        "port": port,
-    }
-    if parsed.get("username"):
-        result["user"] = parsed["username"]
-    if parsed.get("password"):
-        result["password"] = parsed["password"]
-
-    database = parsed.get("database")
-    result["database"] = database if database else "admin"
-
-    options = parsed.get("options") or {}
-    if options.get("replicaset"):
-        result["replica_set"] = options["replicaset"]
-    if options.get("authsource"):
-        result["auth_source"] = options["authsource"]
-
-    # mongodb+srv:// always implies TLS
-    if uri.startswith("mongodb+srv://"):
-        result["ssl"] = "true"
-        # Allow invalid certs so the tap can connect on systems where the
-        # local CA store is not found (e.g. macOS + Python).  The subprocess
-        # also receives SSL_CERT_FILE via the environment as a primary fix.
-        result.setdefault("verify_mode", "false")
-
-    return result
-
-
-def build_singer_config(
-    source_type: str,
-    connection_config: Dict[str, Any],
-    source_config: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    source_type = ensure_supported_source(source_type)
-    source_config = source_config or {}
-    conn = connection_config or {}
-
-    cfg: Dict[str, Any] = {}
-
-    # ── MongoDB: if a connection string is provided, parse it into individual
-    # fields so the Singer tap receives the required keys (host, port, user,
-    # password, database).
-    if source_type == "mongodb":
-        mongo_uri = (
-            conn.get("connection_string_mongo")
-            or conn.get("connection_string")
-        )
-        if mongo_uri and not conn.get("host"):
-            parsed = _parse_mongo_uri(mongo_uri)
-            # Seed cfg with parsed values; explicit conn fields override below.
-            cfg.update(parsed)
-
-    # Common relational mapping.
-    host = conn.get("host")
-    port = conn.get("port")
-    username = conn.get("username") or conn.get("user")
-    password = conn.get("password")
-    database = conn.get("database") or conn.get("dbname")
-
-    if host is not None:
-        cfg["host"] = host
-    if port is not None:
-        cfg["port"] = int(port)
-    if username is not None:
-        cfg["user"] = username
-    if password is not None:
-        cfg["password"] = password
-
-    if source_type == "postgresql" and database is not None:
-        cfg["dbname"] = database
-    if source_type == "mysql" and database is not None:
-        cfg["database"] = database
-    if source_type == "mongodb":
-        cfg["database"] = database if database else (cfg.get("database") or "admin")
-
-    if conn.get("ssl") is not None:
-        ssl_value = conn["ssl"]
-        if isinstance(ssl_value, bool):
-            cfg["ssl"] = "true" if ssl_value else "false"
-        else:
-            cfg["ssl"] = str(ssl_value).lower()
-
-    if conn.get("replica_set") is not None:
-        cfg["replica_set"] = conn["replica_set"]
-    # MongoDB: auth_source is required for SCRAM auth. Default to "admin" when
-    # credentials exist but auth_source is missing—most users are created in admin.
-    if source_type == "mongodb":
-        auth_src = (
-            conn.get("auth_source")
-            or conn.get("authSource")  # camelCase from frontend
-            or cfg.get("auth_source")
-        )
-        if auth_src:
-            cfg["auth_source"] = auth_src
-        elif username or cfg.get("user"):
-            cfg["auth_source"] = "admin"
-    if conn.get("tls") is not None:
-        cfg["tls"] = conn["tls"]
-
-    # Pass-through source specific override options.
-    for key, value in source_config.items():
-        if value is not None:
-            cfg[key] = value
-
-    # Allow full connection string input for compatibility.
-    if conn.get("connection_string"):
-        cfg["connection_string"] = conn["connection_string"]
-    if conn.get("connection_string_mongo"):
-        cfg["connection_string_mongo"] = conn["connection_string_mongo"]
-
-    return cfg
-
-
 @contextmanager
 def temporary_json_file(payload: Dict[str, Any]):
     with tempfile.NamedTemporaryFile(mode="w+", suffix=".json", delete=False) as tmp:
@@ -191,23 +46,6 @@ def temporary_json_file(payload: Dict[str, Any]):
             os.unlink(path)
         except FileNotFoundError:
             pass
-
-
-def run_command(command: List[str], env: Dict[str, str], timeout_seconds: int) -> str:
-    process = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=timeout_seconds,
-        check=False,
-    )
-    if process.returncode != 0:
-        stderr = (process.stderr or "").strip()
-        stdout = (process.stdout or "").strip()
-        message = stderr or stdout or "Unknown tap error"
-        raise ETLRuntimeError(message[:4000])
-    return process.stdout or ""
 
 
 def parse_discovery_output(raw_output: str) -> Dict[str, Any]:
@@ -493,9 +331,3 @@ def merge_state(current_state: Optional[Dict[str, Any]], new_state: Optional[Dic
     return merged
 
 
-def chunked(items: List[Dict[str, Any]], chunk_size: int) -> Iterable[List[Dict[str, Any]]]:
-    if chunk_size <= 0:
-        yield items
-        return
-    for idx in range(0, len(items), chunk_size):
-        yield items[idx : idx + chunk_size]
