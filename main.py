@@ -211,6 +211,18 @@ async def root() -> Dict[str, str]:
     return {"service": APP_NAME, "version": APP_VERSION, "status": "ok"}
 
 
+@app.get("/dbt-models")
+async def list_dbt_models(_token: str = Depends(_require_jwt)) -> Dict[str, List[str]]:
+    """List dbt model names from transform/models/*.sql for UI model selector."""
+    models_dir = os.path.join(BASE_DIR, "transform", "models")
+    models: List[str] = []
+    if os.path.isdir(models_dir):
+        for f in os.listdir(models_dir):
+            if f.endswith(".sql"):
+                models.append(f[:-4])
+    return {"models": sorted(models)}
+
+
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "healthy"}
