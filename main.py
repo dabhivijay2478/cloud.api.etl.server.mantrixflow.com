@@ -125,6 +125,7 @@ class TestConnectionRequest(BaseModel):
     connection_string: Optional[str] = None
     connection_string_mongo: Optional[str] = None
     ssl: Optional[Any] = None
+    database_type: Optional[str] = None
     auth_source: Optional[str] = None
     replica_set: Optional[str] = None
     tls: Optional[bool] = None

@@ -180,6 +180,89 @@ def _resolve_project_dir(project_dir: Optional[str]) -> str:
     return base if os.path.isfile(os.path.join(base, "meltano.yml")) else os.getcwd()
 
 
+def _get_tap_executable_path(plugin_name: str, project_dir: str) -> Optional[str]:
+    """Resolve tap executable path. Returns None if not found."""
+    # Meltano installs taps at .meltano/extractors/<plugin>/venv/bin/<plugin>
+    exe_path = os.path.join(
+        project_dir, ".meltano", "extractors", plugin_name, "venv", "bin", plugin_name
+    )
+    return exe_path if os.path.isfile(exe_path) else None
+
+
+async def run_tap_direct(
+    plugin_name: str,
+    config_path: str,
+    args: Optional[List[str]] = None,
+    *,
+    project_dir: Optional[str] = None,
+    timeout_seconds: int = DEFAULT_INVOKE_TIMEOUT_SECONDS,
+) -> MeltanoRunResult:
+    """Run tap executable directly with --config file, bypassing Meltano.
+
+    Meltano may skip env var parsing; this ensures our config is used.
+    """
+    work_dir = _resolve_project_dir(project_dir)
+    exe = _get_tap_executable_path(plugin_name, work_dir)
+    if not exe:
+        return MeltanoRunResult(
+            exit_code=-1,
+            stdout="",
+            stderr=f"Tap executable not found: {plugin_name}. Run 'meltano install'.",
+            success=False,
+            error_type="config",
+            user_message=f"Tap {plugin_name} is not installed. Run 'meltano install' in the ETL project.",
+        )
+
+    cmd = [exe, "--config", config_path, *(args or [])]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=work_dir,
+        env=os.environ.copy(),
+    )
+
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return MeltanoRunResult(
+            exit_code=-1,
+            stdout="",
+            stderr=f"Tap timed out after {timeout_seconds} seconds",
+            success=False,
+            error_type="timeout",
+            user_message=f"Discovery exceeded the timeout of {timeout_seconds} seconds.",
+        )
+
+    stdout_str = (stdout_bytes or b"").decode("utf-8", errors="replace")
+    stderr_str = (stderr_bytes or b"").decode("utf-8", errors="replace")
+    exit_code = proc.returncode or -1
+    success = exit_code == 0
+
+    result = MeltanoRunResult(
+        exit_code=exit_code,
+        stdout=stdout_str,
+        stderr=stderr_str,
+        success=success,
+    )
+    user_msg = _infer_user_message(result)
+    if user_msg:
+        result = MeltanoRunResult(
+            exit_code=exit_code,
+            stdout=stdout_str,
+            stderr=stderr_str,
+            success=success,
+            error_type="cdc_setup",
+            user_message=user_msg,
+        )
+    return result
+
+
 async def run_meltano_invoke(
     plugin_name: str,
     args: List[str],

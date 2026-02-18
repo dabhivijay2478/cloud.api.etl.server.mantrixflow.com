@@ -1,6 +1,7 @@
 """Map generic connection_config to Meltano environment variables and tap config.
 
-Meltano env format: MELTANO_EXTRACTOR_<PLUGIN>_<SETTING> (e.g. MELTANO_EXTRACTOR_TAP_POSTGRES_SQLALCHEMY_URL)
+Meltano env format: MELTANO_<TYPE>_<NAME>_CONFIG_<SETTING>
+(e.g. MELTANO_EXTRACTOR_TAP_POSTGRES_CONFIG_SQLALCHEMY_URL)
 """
 
 from __future__ import annotations
@@ -78,7 +79,22 @@ def _build_postgres_sqlalchemy_url(conn: Dict[str, Any]) -> str:
             auth += f":{quote_plus(str(password))}"
         auth += "@"
 
-    return f"postgresql://{auth}{host}:{port}/{database}"
+    base_url = f"postgresql://{auth}{host}:{port}/{database}"
+
+    # Neon, Supabase, and other cloud Postgres require SSL
+    ssl = conn.get("ssl")
+    ssl_enabled = (
+        ssl is True
+        or (isinstance(ssl, dict) and ssl.get("enabled"))
+        or conn.get("database_type") in ("neon", "supabase")
+        or "neon.tech" in str(host).lower()
+        or "supabase" in str(host).lower()
+    )
+    if ssl_enabled:
+        sep = "?" if "?" not in base_url else "&"
+        base_url += f"{sep}sslmode=require"
+
+    return base_url
 
 
 def _build_mysql_sqlalchemy_url(conn: Dict[str, Any]) -> str:
@@ -211,8 +227,11 @@ def _connection_config_to_loader_config(
 def _config_dict_to_env_vars(
     plugin_name: str, config: Dict[str, Any], prefix: str = "MELTANO_EXTRACTOR"
 ) -> Dict[str, str]:
-    """Convert config dict to MELTANO_* env vars. Values must be strings."""
-    env_prefix = f"{prefix}_{_plugin_name_to_env_prefix(plugin_name)}"
+    """Convert config dict to MELTANO_* env vars. Values must be strings.
+
+    Meltano expects: MELTANO_<TYPE>_<NAME>_CONFIG_<SETTING>
+    """
+    env_prefix = f"{prefix}_{_plugin_name_to_env_prefix(plugin_name)}_CONFIG"
     env: Dict[str, str] = {}
     for key, value in config.items():
         if value is None:
