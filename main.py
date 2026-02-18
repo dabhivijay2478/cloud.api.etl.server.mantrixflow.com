@@ -125,10 +125,12 @@ class TestConnectionRequest(BaseModel):
     connection_string: Optional[str] = None
     connection_string_mongo: Optional[str] = None
     ssl: Optional[Any] = None
-    database_type: Optional[str] = None
+    database_type: Optional[str] = Field(None, alias="databaseType")
     auth_source: Optional[str] = None
     replica_set: Optional[str] = None
     tls: Optional[bool] = None
+
+    model_config = {"populate_by_name": True}
 
 
 class RunMeltanoPipelineRequest(BaseModel):

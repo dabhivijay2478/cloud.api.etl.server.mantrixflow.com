@@ -134,7 +134,7 @@ async def run_meltano_job(
 
     stdout_str = (stdout_bytes or b"").decode("utf-8", errors="replace")
     stderr_str = (stderr_bytes or b"").decode("utf-8", errors="replace")
-    exit_code = proc.returncode or -1
+    exit_code = proc.returncode if proc.returncode is not None else -1
     success = exit_code == 0
 
     result = MeltanoRunResult(
@@ -241,7 +241,7 @@ async def run_tap_direct(
 
     stdout_str = (stdout_bytes or b"").decode("utf-8", errors="replace")
     stderr_str = (stderr_bytes or b"").decode("utf-8", errors="replace")
-    exit_code = proc.returncode or -1
+    exit_code = proc.returncode if proc.returncode is not None else -1
     success = exit_code == 0
 
     result = MeltanoRunResult(
@@ -313,7 +313,7 @@ async def run_meltano_invoke(
 
     stdout_str = (stdout_bytes or b"").decode("utf-8", errors="replace")
     stderr_str = (stderr_bytes or b"").decode("utf-8", errors="replace")
-    exit_code = proc.returncode or -1
+    exit_code = proc.returncode if proc.returncode is not None else -1
     success = exit_code == 0
 
     result = MeltanoRunResult(

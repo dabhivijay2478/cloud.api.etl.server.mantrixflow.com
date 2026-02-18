@@ -15,9 +15,15 @@ from utils import ensure_supported_source, parse_discovery_output, temporary_jso
 
 def _distill_error_message(raw: str) -> str:
     """Extract a user-friendly error from tap stderr/traceback."""
+    if not raw or not raw.strip():
+        return "Connection failed"
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
-    # Prefer the last exception line (actual error)
+    # Skip noisy INFO logs like "Skipping parse of env var settings"
+    skip_patterns = ("skipping parse", "info", "| info")
+    # Prefer the last exception/error line
     for line in reversed(lines):
+        if any(s in line.lower() for s in skip_patterns):
+            continue
         if any(
             x in line.lower()
             for x in (
@@ -29,14 +35,19 @@ def _distill_error_message(raw: str) -> str:
                 "connection refused",
                 "ssl",
                 "timeout",
+                "assertionerror",
+                "operationalerror",
             )
         ) and "traceback" not in line.lower() and "file " not in line:
             return line
-    # Fallback: last non-empty line
+    # Fallback: last meaningful line (not a log line with |)
     for line in reversed(lines):
         if line and not line.startswith("File ") and "|" not in line:
             return line
-    return raw[:500] if raw else "Connection failed"
+    # If only log lines (e.g. "Skipping parse..."), avoid surfacing that; show tail for traceback
+    if "skipping parse" in raw.lower() and len(lines) <= 2:
+        return "Connection failed. The database may require SSL (e.g. Neon, Supabase)."
+    return raw[-1000:] if len(raw) > 1000 else raw
 
 
 async def run_discovery(
@@ -80,8 +91,8 @@ async def run_discovery(
         )
 
     if not result.success:
-        raw = result.user_message or result.stderr or result.stdout or f"Exit code {result.exit_code}"
-        # Extract user-friendly error; avoid surfacing noisy logs like "Skipping parse of env var"
+        # Combine stderr and stdout; tap may write traceback to either
+        raw = result.user_message or f"{result.stderr or ''}\n{result.stdout or ''}".strip() or f"Exit code {result.exit_code}"
         msg = _distill_error_message(raw)
         raise RuntimeError(msg)
 
