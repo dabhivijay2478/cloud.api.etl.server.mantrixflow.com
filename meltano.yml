@@ -44,10 +44,12 @@ plugins:
         database: ${MONGODB_DATABASE}
         flattening_enabled: true
         flattening_max_depth: 5
+        default_replication_method: INCREMENTAL
       metadata:
         "*":
           replication-method: INCREMENTAL
-          replication-key: _id
+          # tap-mongodb yields "replication_key" (not _id) in output records
+          replication-key: replication_key
 
   loaders:
     - name: target-postgres
@@ -76,23 +78,21 @@ plugins:
 # For postgres-to-mongodb use: POST /run-meltano-pipeline (dynamic mode).
 
 jobs:
+  # Sync-only jobs (tap+target, no dbt) - use when dbt profiles path fails or transform not needed
   - name: mongodb-to-postgres
     tasks:
       - tap-mongodb
       - target-postgres
-      - dbt-postgres
 
   - name: postgres-to-postgres
     tasks:
       - tap-postgres
       - target-postgres
-      - dbt-postgres
 
   - name: mysql-to-postgres
     tasks:
       - tap-mysql
       - target-postgres
-      - dbt-postgres
 
 schedules:
   - name: mongodb-to-postgres-hourly

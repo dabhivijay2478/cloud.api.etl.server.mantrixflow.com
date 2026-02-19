@@ -5,6 +5,7 @@ Runs tap → target jobs with dynamic connection config.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -44,6 +45,11 @@ def _parse_row_counts_from_output(stdout: str, stderr: str) -> tuple[int, int]:
         line_lower = line.lower()
         if '"type": "record"' in line_lower or '"type":"record"' in line_lower:
             rows_read += 1
+        # Tap METRIC: metric_name=record_count metric_value=N
+        if "metric_name=record_count" in line_lower and "metric_value=" in line_lower:
+            m = re.search(r"metric_value[=:](\d+)", line_lower, re.IGNORECASE)
+            if m:
+                rows_read = max(rows_read, int(m.group(1)))
         if "records loaded" in line_lower or "rows loaded" in line_lower:
             for part in line.split():
                 if part.isdigit():
@@ -63,6 +69,8 @@ async def run_pipeline_job(
     checkpoint: Optional[Dict[str, Any]] = None,
     sync_mode: Optional[str] = None,
     dbt_models: Optional[list[str]] = None,
+    source_table: Optional[str] = None,
+    dest_table: Optional[str] = None,
     timeout_seconds: int = 3600,
 ) -> PipelineRunResult:
     """Run a Meltano pipeline job with dynamic connection config.
@@ -84,6 +92,7 @@ async def run_pipeline_job(
         source_type, source_connection_config, dest_type, dest_connection_config,
         sync_mode=sync_mode,
         dbt_models=dbt_models,
+        source_table=source_table,
     )
 
     run_args: list[str] = []

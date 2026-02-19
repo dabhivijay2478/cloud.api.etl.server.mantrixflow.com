@@ -423,6 +423,8 @@ async def run_meltano_pipeline(
             checkpoint=payload.checkpoint,
             sync_mode=payload.sync_mode,
             dbt_models=payload.dbt_models,
+            source_table=payload.source_table,
+            dest_table=payload.dest_table,
             timeout_seconds=TAP_TIMEOUT_SECONDS,
         )
     except Exception as exc:

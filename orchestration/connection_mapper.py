@@ -6,6 +6,7 @@ Meltano env format: MELTANO_<TYPE>_<NAME>_CONFIG_<SETTING>
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Literal, Optional
 from urllib.parse import parse_qs, quote_plus, unquote_plus, urlparse
 
@@ -172,6 +173,10 @@ def _connection_config_to_extractor_config(
         config = {"sqlalchemy_url": _build_postgres_sqlalchemy_url(conn)}
     elif source_type == "mysql":
         config = {"sqlalchemy_url": _build_mysql_sqlalchemy_url(conn)}
+        # Limit to user database to avoid PROCESS privilege on information_schema
+        db = conn.get("database") or conn.get("dbname")
+        if db:
+            config["filter_schemas"] = [db]
     elif source_type == "mongodb":
         config = _build_mongodb_connection_config(conn)
     else:
@@ -227,16 +232,18 @@ def _connection_config_to_loader_config(
 def _config_dict_to_env_vars(
     plugin_name: str, config: Dict[str, Any], prefix: str = "MELTANO_EXTRACTOR"
 ) -> Dict[str, str]:
-    """Convert config dict to MELTANO_* env vars. Values must be strings.
+    """Convert config dict to env vars Meltano reads. Values must be strings.
 
-    Meltano expects: MELTANO_<TYPE>_<NAME>_CONFIG_<SETTING>
+    Meltano expects: <PLUGIN_PREFIX>_<SETTING_NAME> (e.g. TAP_MONGODB_DATABASE).
+    Use `meltano config list <plugin>` to verify. Not MELTANO_*_CONFIG_*.
     """
-    env_prefix = f"{prefix}_{_plugin_name_to_env_prefix(plugin_name)}_CONFIG"
+    plugin_prefix = _plugin_name_to_env_prefix(plugin_name)
     env: Dict[str, str] = {}
     for key, value in config.items():
         if value is None:
             continue
-        env_key = f"{env_prefix}_{key.upper()}"
+        # Setting names: database, mongodb_connection_string -> DATABASE, MONGODB_CONNECTION_STRING
+        env_key = f"{plugin_prefix}_{key.upper().replace('-', '_')}"
         env[env_key] = str(value)
     return env
 
@@ -326,12 +333,14 @@ def connection_config_to_meltano_env_for_pipeline(
     *,
     sync_mode: Optional[str] = None,
     dbt_models: Optional[list[str]] = None,
+    source_table: Optional[str] = None,
 ) -> Dict[str, str]:
     """Build combined env vars for a full pipeline (extractor + loader + dbt when dest is postgres).
 
     Merges extractor, loader, and dbt-postgres env vars when destination is PostgreSQL.
     When sync_mode is 'incremental', sets default_replication_method=LOG_BASED for CDC.
     When dbt_models is provided, sets DBT_SELECT for dbt model selection.
+    When source_table is provided for MongoDB, sets filter_collections to restrict to that collection.
     """
     extractor_env = connection_config_to_meltano_env(
         source_type, source_connection_config, role="extractor", sync_mode=sync_mode
@@ -340,6 +349,18 @@ def connection_config_to_meltano_env_for_pipeline(
         dest_type, dest_connection_config, role="loader"
     )
     result = {**extractor_env, **loader_env}
+
+    # Stream selection (per Meltano docs: filter_collections + select_filter)
+    if source_table:
+        if source_type == "mongodb":
+            # filter_collections: limits discovery to this collection (tap-mongodb setting)
+            result["TAP_MONGODB_FILTER_COLLECTIONS"] = json.dumps([source_table])
+            # select_filter: runtime stream filter (Meltano extractor extra)
+            result["TAP_MONGODB__SELECT_FILTER"] = json.dumps([source_table])
+        elif source_type == "postgresql":
+            result["TAP_POSTGRES__SELECT_FILTER"] = json.dumps([source_table])
+        elif source_type == "mysql":
+            result["TAP_MYSQL__SELECT_FILTER"] = json.dumps([source_table])
 
     if dest_type == "postgresql":
         dbt_env = _connection_config_to_dbt_postgres_env(dest_connection_config)
