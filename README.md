@@ -2,7 +2,11 @@
 
 FastAPI microservice for data extraction, transformation, and loading (ETL) operations.
 
-**Vercel + Meltano**: See [VERCEL_DEPLOYMENT.md](../../VERCEL_DEPLOYMENT.md) for deploying ETL, API (NestJS), and Meltano pipelines to Vercel.
+## Deployment
+
+- **Fly.io (Docker)**: `fly deploy` from `apps/etl` — see [Fly.io](#flyio) below
+- **Local Docker**: `docker compose up -d` from `apps/etl` — see [Local Docker](#local-docker) below
+- **Vercel**: See [VERCEL_DEPLOYMENT.md](../../VERCEL_DEPLOYMENT.md) for serverless deployment
 
 ## Features
 
@@ -131,6 +135,26 @@ python main.py
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8001 --reload
 ```
+
+### Option 5: Local Docker
+
+```bash
+cd apps/etl
+docker compose up -d
+# ETL at http://localhost:8001
+```
+
+The image uses Python 3.11 for Meltano plugin compatibility (target-mysql, target-mongodb). Set `ETL_AUTH_TOKEN` in `.env` or pass at runtime. Pipelines use connection config from API (no DB URLs needed in container).
+
+### Option 6: Fly.io
+
+```bash
+cd apps/etl
+fly launch   # first time: creates app, sets secrets
+fly deploy   # subsequent deploys
+```
+
+Set secrets: `fly secrets set ETL_AUTH_TOKEN=your-token`. Pipelines connect to your databases (Supabase, MySQL, MongoDB Atlas, etc.) via connection config from the API.
 
 ## API Endpoints
 

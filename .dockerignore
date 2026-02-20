@@ -1,27 +1,39 @@
-# Python
-__pycache__
-*.py[cod]
-*$py.class
-.venv
-venv
+# Dependencies and venv
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Tests (not needed in container)
+tests/
+*.test.yml
+docker-compose.test.yml
+
+# Local scripts (Docker uses meltano install from meltano.yml)
+*.sh
+scripts/
+connectors/
+# Keep plugins/ - Meltano lock files for reproducible installs
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Env and secrets (set at runtime)
 .env
 .env.*
 !.env.example
 
-# Meltano (rebuilt in container)
-.meltano
-
-# IDE / OS
-.idea
-.vscode
-.DS_Store
-
-# Tests
-.pytest_cache
-.coverage
-htmlcov
+# Logs and artifacts
+test-logs/
 *.log
+logs/
 
 # Git
-.git
+.git/
 .gitignore

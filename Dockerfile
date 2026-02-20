@@ -4,31 +4,34 @@
 # -----------------------------------------------------------------------------
 # Stage 1: Build - Install Meltano and plugins
 # -----------------------------------------------------------------------------
-FROM python:3.12-slim AS meltano-builder
+FROM python:3.11-slim AS meltano-builder
 
 WORKDIR /app
 
-# Install system deps for Meltano and taps
+# Install system deps for Meltano, taps, and target-mysql (mysqlclient)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     git \
     curl \
+    pkg-config \
+    default-libmysqlclient-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Meltano
+# Install Meltano (Python 3.11 avoids pendulum/distutils issues on 3.12)
 RUN pip install --no-cache-dir meltano
 
 # Copy Meltano project files first (for layer caching)
 COPY meltano.yml ./
+COPY plugins/ ./plugins/
 COPY transform/ ./transform/
 
-# Install Meltano plugins (tap-postgres, tap-mysql, tap-mongodb, target-postgres, dbt-postgres)
+# Install Meltano plugins (all taps, targets, dbt-postgres)
 RUN meltano install
 
 # -----------------------------------------------------------------------------
 # Stage 2: Runtime - FastAPI + Meltano
 # -----------------------------------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
@@ -60,13 +63,13 @@ COPY api/ ./api/
 # Ensure Meltano project is valid
 RUN meltano config 2>/dev/null || true
 
-# Expose port
-ENV PORT=8001
-EXPOSE ${PORT}
+# Port: 8080 for Fly.io (sets PORT), 8001 for local docker-compose override
+ENV PORT=8080
+EXPOSE 8080
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
 
-# Start FastAPI
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+# Start FastAPI (use PORT from env for Fly.io compatibility)
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT}"]

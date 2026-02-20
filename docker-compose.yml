@@ -1,0 +1,22 @@
+# ETL Service - Local Docker run
+# Usage: docker compose up -d   (from apps/etl)
+# Health: http://localhost:8001/health
+
+services:
+  etl:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8080"
+    environment:
+      PORT: "8080"
+      ETL_AUTH_TOKEN: ${ETL_AUTH_TOKEN:-test-token}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

@@ -1,0 +1,37 @@
+# Fly.io ETL Service - Deploy: fly deploy (from apps/etl)
+# https://fly.io/docs/reference/configuration/
+
+app = "ai-bi-etl"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[checks]
+  [checks.health]
+    port = 8080
+    type = "http"
+    interval = "30s"
+    timeout = "10s"
+    path = "/health"
+    grace_period = "10s"
