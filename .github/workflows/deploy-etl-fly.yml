@@ -1,0 +1,37 @@
+# Deploy ETL service to Fly.io
+# https://fly.io/docs/launch/continuous-deployment-with-github-actions/
+
+name: Deploy ETL to Fly.io
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'apps/etl/**'
+      - 'apps/etl/.github/workflows/deploy-etl-fly.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy ETL to Fly.io
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-etl
+      cancel-in-progress: false
+
+    defaults:
+      run:
+        working-directory: apps/etl
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy to Fly.io
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
