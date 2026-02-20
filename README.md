@@ -156,6 +156,8 @@ fly deploy   # subsequent deploys
 
 Set secrets: `fly secrets set ETL_AUTH_TOKEN=your-token`. Pipelines connect to your databases (Supabase, MySQL, MongoDB Atlas, etc.) via connection config from the API.
 
+**CI/CD (GitHub Actions):** Pushes to `main` that touch `apps/etl/` trigger an automatic deploy. Add `FLY_API_TOKEN` in GitHub → Settings → Secrets and variables → Actions. Create a deploy token with `fly tokens create deploy -x 999999h` (from `apps/etl`). You can also trigger a deploy manually from the Actions tab.
+
 ## API Endpoints
 
 ### Health Check
