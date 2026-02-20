@@ -136,10 +136,15 @@ class TestConnectionRequest(BaseModel):
 class RunMeltanoPipelineRequest(BaseModel):
     """Dynamic Meltano-style pipeline. Connections come from DB (passed by API at run time)."""
     direction: Literal[
-        "postgres-to-mongodb",
-        "mongodb-to-postgres",
         "postgres-to-postgres",
+        "postgres-to-mysql",
+        "postgres-to-mongodb",
         "mysql-to-postgres",
+        "mysql-to-mysql",
+        "mysql-to-mongodb",
+        "mongodb-to-postgres",
+        "mongodb-to-mysql",
+        "mongodb-to-mongodb",
     ]
     source_connection_config: Dict[str, Any]
     dest_connection_config: Dict[str, Any]
@@ -382,16 +387,20 @@ async def run_meltano_pipeline(
     Run a Meltano pipeline with dynamic connections. Clean Engine: Meltano only, no legacy fallback.
     """
     direction = payload.direction
-    if direction == "postgres-to-mongodb":
-        source_type, dest_type = "postgresql", "mongodb"
-    elif direction == "mongodb-to-postgres":
-        source_type, dest_type = "mongodb", "postgresql"
-    elif direction == "postgres-to-postgres":
-        source_type, dest_type = "postgresql", "postgresql"
-    elif direction == "mysql-to-postgres":
-        source_type, dest_type = "mysql", "postgresql"
-    else:
+    _DIRECTION_MAP = {
+        "postgres-to-postgres": ("postgresql", "postgresql"),
+        "postgres-to-mysql": ("postgresql", "mysql"),
+        "postgres-to-mongodb": ("postgresql", "mongodb"),
+        "mysql-to-postgres": ("mysql", "postgresql"),
+        "mysql-to-mysql": ("mysql", "mysql"),
+        "mysql-to-mongodb": ("mysql", "mongodb"),
+        "mongodb-to-postgres": ("mongodb", "postgresql"),
+        "mongodb-to-mysql": ("mongodb", "mysql"),
+        "mongodb-to-mongodb": ("mongodb", "mongodb"),
+    }
+    if direction not in _DIRECTION_MAP:
         raise HTTPException(status_code=400, detail=f"Unsupported direction: {direction}")
+    source_type, dest_type = _DIRECTION_MAP[direction]
 
     job_name = get_job_for_direction(source_type, dest_type)
     if job_name is None:

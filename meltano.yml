@@ -1,15 +1,11 @@
-# Meltano Project: Postgres ↔ MongoDB Sync
+# Meltano Project: Bidirectional ETL (Postgres ↔ MySQL ↔ MongoDB)
 # https://docs.meltano.com/concepts/project
 #
-# DYNAMIC MODE (recommended; connections from database at pipeline run time):
-#   Use the ETL API: POST /run-meltano-pipeline
-#   Supports both postgres-to-mongodb and mongodb-to-postgres. No Meltano install needed.
+# DYNAMIC MODE (recommended): Use ETL API POST /run-meltano-pipeline
+#   Supports all 9 directions including same-type: postgres/mysql/mongodb → postgres/mysql/mongodb
 #
-# STATIC MODE (CLI/cron, mongodb-to-postgres only):
-#   target-mongodb (hotglue) fails on Python 3.12 (pendulum/distutils). Use dynamic API for
-#   postgres-to-mongodb. For mongodb-to-postgres via Meltano CLI:
-#   Set POSTGRES_URL, MONGODB_URI, MONGODB_DATABASE in .env
-#   Run: meltano install && meltano run mongodb-to-postgres
+# STATIC MODE (CLI): Set POSTGRES_URL, MYSQL_URL, MONGODB_URI, MONGODB_DATABASE in .env
+#   Run: meltano install && meltano run <job-name>
 
 project_id: ai-bi-etl
 default_environment: dev
@@ -61,6 +57,21 @@ plugins:
         flattening_enabled: true
         flattening_max_depth: 5
 
+    - name: target-mysql
+      variant: thkwag
+      config:
+        sqlalchemy_url: ${MYSQL_URL}
+        flattening_enabled: true
+        flattening_max_depth: 5
+
+    - name: target-mongodb
+      variant: hotgluexyz
+      config:
+        connection_string: ${MONGODB_URI}
+        db_name: ${MONGODB_DATABASE}
+        flattening_enabled: true
+        flattening_max_depth: 5
+
   utilities:
     - name: dbt-postgres
       variant: dbt-labs
@@ -74,25 +85,43 @@ plugins:
         dbname: ${POSTGRES_DBNAME:-postgres}
         schema: public
 
-# target-mongodb (hotglue) removed: fails on Python 3.12 due to pendulum/distutils.
-# For postgres-to-mongodb use: POST /run-meltano-pipeline (dynamic mode).
-
 jobs:
-  # Sync-only jobs (tap+target, no dbt) - use when dbt profiles path fails or transform not needed
+  # Bidirectional ETL: all tap+target combinations
   - name: mongodb-to-postgres
     tasks:
-      - tap-mongodb
-      - target-postgres
+      - tap-mongodb target-postgres
 
   - name: postgres-to-postgres
     tasks:
-      - tap-postgres
-      - target-postgres
+      - tap-postgres target-postgres
 
   - name: mysql-to-postgres
     tasks:
-      - tap-mysql
-      - target-postgres
+      - tap-mysql target-postgres
+
+  - name: postgres-to-mysql
+    tasks:
+      - tap-postgres target-mysql
+
+  - name: postgres-to-mongodb
+    tasks:
+      - tap-postgres target-mongodb
+
+  - name: mysql-to-mongodb
+    tasks:
+      - tap-mysql target-mongodb
+
+  - name: mongodb-to-mysql
+    tasks:
+      - tap-mongodb target-mysql
+
+  - name: mysql-to-mysql
+    tasks:
+      - tap-mysql target-mysql
+
+  - name: mongodb-to-mongodb
+    tasks:
+      - tap-mongodb target-mongodb
 
 schedules:
   - name: mongodb-to-postgres-hourly

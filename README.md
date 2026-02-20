@@ -195,7 +195,7 @@ curl -X POST http://localhost:8001/discover-schema/postgresql \
 
 ## Run Meltano Pipeline
 
-Use `POST /run-meltano-pipeline` for end-to-end data movement (extract, optional transform via dbt, load). See API docs for supported directions (postgres-to-postgres, mysql-to-postgres, postgres-to-mongodb, mongodb-to-postgres).
+Use `POST /run-meltano-pipeline` for end-to-end data movement (extract, optional transform via dbt, load). Supports all 9 directions: postgres/mysql/mongodb → postgres/mysql/mongodb (including same-type: postgres-to-postgres, mysql-to-mysql, mongodb-to-mongodb).
 
 ## Development
 

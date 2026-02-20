@@ -212,6 +212,15 @@ def connection_config_to_tap_config(
     return config
 
 
+def _build_mongodb_loader_config(conn: Dict[str, Any]) -> Dict[str, Any]:
+    """Build target-mongodb config: connection_string, db_name (loader uses different keys than tap)."""
+    mongo = _build_mongodb_connection_config(conn)
+    return {
+        "connection_string": mongo["mongodb_connection_string"],
+        "db_name": mongo["database"],
+    }
+
+
 def _connection_config_to_loader_config(
     dest_type: str, connection_config: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -224,7 +233,7 @@ def _connection_config_to_loader_config(
     if dest_type == "mysql":
         return {"sqlalchemy_url": _build_mysql_sqlalchemy_url(conn)}
     if dest_type == "mongodb":
-        return _build_mongodb_connection_config(conn)
+        return _build_mongodb_loader_config(conn)
 
     raise ValueError(f"Unsupported destination type: {dest_type}")
 
@@ -361,6 +370,9 @@ def connection_config_to_meltano_env_for_pipeline(
             result["TAP_POSTGRES__SELECT_FILTER"] = json.dumps([source_table])
         elif source_type == "mysql":
             result["TAP_MYSQL__SELECT_FILTER"] = json.dumps([source_table])
+
+    # mongodb-to-mysql: tap-mongodb emits replication_key VARCHAR(1000). With utf8mb4 (4 bytes/char)
+    # that exceeds MySQL index limit (3072). Test MySQL uses utf8 (3 bytes/char) via docker-compose.
 
     if dest_type == "postgresql":
         dbt_env = _connection_config_to_dbt_postgres_env(dest_connection_config)

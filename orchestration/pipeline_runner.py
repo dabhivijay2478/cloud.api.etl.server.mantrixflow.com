@@ -12,12 +12,17 @@ from typing import Any, Dict, Optional
 from .connection_mapper import connection_config_to_meltano_env_for_pipeline
 from .meltano_runner import MeltanoRunResult, run_meltano_job
 
-# Map (source_type, dest_type) -> Meltano job name
-# postgres-to-mongodb: no Meltano job (target-mongodb fails on Python 3.12)
+# Map (source_type, dest_type) -> Meltano job name (bidirectional ETL + same-type sync)
 DIRECTION_TO_JOB: Dict[tuple[str, str], str] = {
     ("mongodb", "postgresql"): "mongodb-to-postgres",
     ("postgresql", "postgresql"): "postgres-to-postgres",
     ("mysql", "postgresql"): "mysql-to-postgres",
+    ("postgresql", "mysql"): "postgres-to-mysql",
+    ("postgresql", "mongodb"): "postgres-to-mongodb",
+    ("mysql", "mongodb"): "mysql-to-mongodb",
+    ("mongodb", "mysql"): "mongodb-to-mysql",
+    ("mysql", "mysql"): "mysql-to-mysql",
+    ("mongodb", "mongodb"): "mongodb-to-mongodb",
 }
 
 
