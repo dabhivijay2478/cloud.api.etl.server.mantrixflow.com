@@ -137,6 +137,8 @@ class TestConnectionRequest(BaseModel):
 
 class RunMeltanoPipelineRequest(BaseModel):
     """Dynamic Meltano-style pipeline. Connections come from DB (passed by API at run time)."""
+    model_config = {"populate_by_name": True, "extra": "ignore"}
+
     direction: Literal[
         "postgres-to-postgres",
         "postgres-to-mysql",

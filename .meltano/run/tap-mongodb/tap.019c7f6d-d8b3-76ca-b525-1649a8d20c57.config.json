@@ -1,0 +1,21 @@
+{
+  "add_record_metadata": false,
+  "allow_modify_change_streams": false,
+  "database": "testdb",
+  "datetime_conversion": "datetime",
+  "filter_collections": [
+    "test_customers"
+  ],
+  "flattening_enabled": true,
+  "flattening_max_depth": 5,
+  "mongodb_connection_string": "mongodb://testuser:testpass@localhost:27018/testdb?authSource=admin&tls=false",
+  "operation_types": [
+    "create",
+    "delete",
+    "insert",
+    "replace",
+    "update"
+  ],
+  "prefix": "",
+  "default_replication_method": "FULL_TABLE"
+}

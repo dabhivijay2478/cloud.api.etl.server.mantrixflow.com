@@ -1,0 +1,9 @@
+{
+  "allow_column_alter": false,
+  "driver_name": "mysql",
+  "flattening_enabled": true,
+  "flattening_max_depth": 5,
+  "lower_case_table_names": true,
+  "replace_null": false,
+  "sqlalchemy_url": "mysql+pymysql://testuser:testpass@localhost:13306/testdb"
+}

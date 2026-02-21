@@ -147,6 +147,146 @@
       "selected": false
     },
     {
+      "tap_stream_id": "testdb-test_customers_temp",
+      "table_name": "test_customers_temp",
+      "replication_method": "",
+      "key_properties": [],
+      "schema": {
+        "properties": {
+          "cluster_time": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "document": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace__database": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace__collection": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "object_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replication_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema"
+      },
+      "is_view": false,
+      "stream": "testdb-test_customers_temp",
+      "metadata": [
+        {
+          "breadcrumb": [
+            "properties",
+            "cluster_time"
+          ],
+          "metadata": {
+            "inclusion": "available",
+            "selected": true
+          }
+        },
+        {
+          "breadcrumb": [
+            "properties",
+            "document"
+          ],
+          "metadata": {
+            "inclusion": "available",
+            "selected": true
+          }
+        },
+        {
+          "breadcrumb": [
+            "properties",
+            "namespace__database"
+          ],
+          "metadata": {
+            "inclusion": "available",
+            "selected": true
+          }
+        },
+        {
+          "breadcrumb": [
+            "properties",
+            "namespace__collection"
+          ],
+          "metadata": {
+            "inclusion": "available",
+            "selected": true
+          }
+        },
+        {
+          "breadcrumb": [
+            "properties",
+            "object_id"
+          ],
+          "metadata": {
+            "inclusion": "available",
+            "selected": true
+          }
+        },
+        {
+          "breadcrumb": [
+            "properties",
+            "operation_type"
+          ],
+          "metadata": {
+            "inclusion": "available",
+            "selected": true
+          }
+        },
+        {
+          "breadcrumb": [
+            "properties",
+            "replication_key"
+          ],
+          "metadata": {
+            "inclusion": "available",
+            "selected": true
+          }
+        },
+        {
+          "breadcrumb": [],
+          "metadata": {
+            "inclusion": "available",
+            "table-key-properties": [],
+            "forced-replication-method": "",
+            "schema-name": "testdb",
+            "selected": false
+          }
+        }
+      ],
+      "selected": false
+    },
+    {
       "tap_stream_id": "testdb-test_products",
       "table_name": "test_products",
       "replication_method": "",
