@@ -198,16 +198,29 @@ def connection_config_to_tap_config(
 ) -> Dict[str, Any]:
     """Build tap config for --config file (e.g. collect invoke).
 
-    Merges connection config with source_config overrides (table, schema, query).
-    Uses sync_mode from connection_config when present for replication method.
+    Merges connection config with source_config overrides.
+    Uses Meltano filter_schemas (postgres/mysql) and filter_collections (mongodb)
+    for schema-based discovery to avoid full-database scans.
     """
     sync_mode = connection_config.get("sync_mode") or connection_config.get("syncMode")
     config = _connection_config_to_extractor_config(
         source_type, connection_config, sync_mode=sync_mode
     )
     if source_config:
+        schema_name = source_config.get("schema_name") or source_config.get("schema")
+        table_name = source_config.get("table_name") or source_config.get("table")
+        st = ensure_supported_source(source_type)
+
+        # Schema-based discovery: use Meltano filter_schemas / filter_collections
+        if schema_name and st in ("postgresql", "mysql"):
+            config["filter_schemas"] = [schema_name]
+        if schema_name and st == "mongodb":
+            config["database"] = schema_name
+        if table_name and st == "mongodb":
+            config["filter_collections"] = [table_name]
+
         for key, value in source_config.items():
-            if value is not None:
+            if value is not None and key not in ("schema_name", "schema", "table_name", "table"):
                 config[key] = value
     return config
 
@@ -334,6 +347,43 @@ def _connection_config_to_dbt_postgres_env(conn: Dict[str, Any]) -> Dict[str, st
     return env
 
 
+def _get_stream_name(
+    source_type: str,
+    source_table: str,
+    source_schema: Optional[str] = None,
+) -> str:
+    """Build tap stream name for stream_maps key. Must match tap output stream name."""
+    if source_type == "mongodb":
+        return source_table
+    schema = (source_schema or "public").strip() or "public"
+    # tap-postgres, tap-mysql use schema-table format (e.g. public-users)
+    return f"{schema}-{source_table}"
+
+
+def _build_stream_maps(
+    source_type: str,
+    source_table: str,
+    source_schema: Optional[str],
+    dest_table: Optional[str],
+    column_renames: Optional[Dict[str, str]],
+) -> Optional[Dict[str, Any]]:
+    """Build stream_maps config for loader (table rename + column renames via Meltano stream_maps)."""
+    if not dest_table and not column_renames:
+        return None
+    stream_name = _get_stream_name(source_type, source_table, source_schema)
+    mapping: Dict[str, Any] = {}
+    if dest_table and dest_table != source_table:
+        mapping["__alias__"] = dest_table
+    if column_renames:
+        for old_col, new_col in column_renames.items():
+            mapping[new_col] = old_col
+            if old_col != new_col:
+                mapping[old_col] = "__NULL__"
+    if not mapping:
+        return None
+    return {stream_name: mapping}
+
+
 def connection_config_to_meltano_env_for_pipeline(
     source_type: str,
     source_connection_config: Dict[str, Any],
@@ -343,6 +393,9 @@ def connection_config_to_meltano_env_for_pipeline(
     sync_mode: Optional[str] = None,
     dbt_models: Optional[list[str]] = None,
     source_table: Optional[str] = None,
+    source_schema: Optional[str] = None,
+    dest_table: Optional[str] = None,
+    column_renames: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
     """Build combined env vars for a full pipeline (extractor + loader + dbt when dest is postgres).
 
@@ -350,6 +403,7 @@ def connection_config_to_meltano_env_for_pipeline(
     When sync_mode is 'incremental', sets default_replication_method=LOG_BASED for CDC.
     When dbt_models is provided, sets DBT_SELECT for dbt model selection.
     When source_table is provided for MongoDB, sets filter_collections to restrict to that collection.
+    When dest_table or column_renames are provided, passes stream_maps to the loader for table/column mapping.
     """
     extractor_env = connection_config_to_meltano_env(
         source_type, source_connection_config, role="extractor", sync_mode=sync_mode
@@ -370,6 +424,17 @@ def connection_config_to_meltano_env_for_pipeline(
             result["TAP_POSTGRES__SELECT_FILTER"] = json.dumps([source_table])
         elif source_type == "mysql":
             result["TAP_MYSQL__SELECT_FILTER"] = json.dumps([source_table])
+
+    # Table/column mapping: stream_maps for loader (dest_table, column_renames)
+    if source_table:
+        stream_maps = _build_stream_maps(
+            source_type, source_table, source_schema, dest_table, column_renames
+        )
+        if stream_maps:
+            loader = SOURCE_TYPE_TO_LOADER.get(dest_type)
+            if loader:
+                prefix = _plugin_name_to_env_prefix(loader)
+                result[f"{prefix}_STREAM_MAPS"] = json.dumps(stream_maps)
 
     # mongodb-to-mysql: tap-mongodb emits replication_key VARCHAR(1000). With utf8mb4 (4 bytes/char)
     # that exceeds MySQL index limit (3072). Test MySQL uses utf8 (3 bytes/char) via docker-compose.

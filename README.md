@@ -158,6 +158,7 @@ Set secrets: `fly secrets set ETL_AUTH_TOKEN=your-token`. Pipelines connect to y
 ### Schema Discovery
 - `POST /discover-schema/{sourceType}` - Discover schema from a data source
   - Supported types: `postgresql`, `mysql`, `mongodb`
+  - **Schema-based discovery**: Pass `schema_name` and/or `table_name` to limit discovery via Meltano `filter_schemas` (postgres/mysql) and `filter_collections` (mongodb), reducing bandwidth vs full-database scans
 
 ### Data Collection
 - `POST /collect/{sourceType}` - Collect data from a source
@@ -214,6 +215,8 @@ curl -X POST http://localhost:8001/discover-schema/postgresql \
 
 Use `POST /run-meltano-pipeline` for end-to-end data movement (extract, optional transform via dbt, load). Supports all 9 directions: postgres/mysql/mongodb → postgres/mysql/mongodb (including same-type: postgres-to-postgres, mysql-to-mysql, mongodb-to-mongodb).
 
+For table-to-table migration with manual column mapping (rename columns, select subset), see [Table-to-Table Migration](docs/TABLE_TO_TABLE_MIGRATION.md).
+
 ## Development
 
 ### Running in Development Mode
@@ -240,6 +243,18 @@ Logs are output to stdout. Set `LOG_LEVEL` in `.env` to control verbosity:
 - `ERROR`: Error messages only
 
 ## Troubleshooting
+
+### Callback POST failed: All connection attempts failed
+
+When ETL runs in Docker and the API is on the host, the ETL container cannot reach `localhost`.
+
+1. **API `.env`**: Set `INTERNAL_API_URL=http://host.docker.internal:5000` (Mac/Win) or `http://172.17.0.1:5000` (Linux).
+2. **ETL `.env` or docker-compose**: Set `ETL_CALLBACK_BASE_URL=http://host.docker.internal:5000` so the container uses a reachable URL (overrides payload callback_url).
+
+- **Mac / Windows**: `INTERNAL_API_URL=http://host.docker.internal:5000`
+- **Linux**: `INTERNAL_API_URL=http://172.17.0.1:5000` (or add `extra_hosts: host.docker.internal: host-gateway` to docker-compose and use `host.docker.internal`)
+
+Replace `5000` with your API port. See [ETL_JOBS_QUEUE.md](../../apps/api/docs/ETL_JOBS_QUEUE.md) for details.
 
 ### Import Errors for Singer Taps
 

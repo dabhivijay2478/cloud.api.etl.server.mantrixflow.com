@@ -75,7 +75,9 @@ async def run_pipeline_job(
     sync_mode: Optional[str] = None,
     dbt_models: Optional[list[str]] = None,
     source_table: Optional[str] = None,
+    source_schema: Optional[str] = None,
     dest_table: Optional[str] = None,
+    column_renames: Optional[Dict[str, str]] = None,
     timeout_seconds: int = 3600,
     meltano_job_id: Optional[str] = None,
 ) -> PipelineRunResult:
@@ -99,6 +101,9 @@ async def run_pipeline_job(
         sync_mode=sync_mode,
         dbt_models=dbt_models,
         source_table=source_table,
+        source_schema=source_schema,
+        dest_table=dest_table,
+        column_renames=column_renames,
     )
 
     run_args: list[str] = []

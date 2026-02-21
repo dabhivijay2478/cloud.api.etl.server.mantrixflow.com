@@ -35,6 +35,8 @@ load_dotenv()
 APP_NAME = "python-etl"
 APP_VERSION = "2.0.0"
 TAP_TIMEOUT_SECONDS = int(os.getenv("TAP_TIMEOUT_SECONDS", "1200"))
+# When ETL runs in Docker, use this so container can reach API on host (e.g. host.docker.internal:5000)
+ETL_CALLBACK_BASE_URL = os.getenv("ETL_CALLBACK_BASE_URL", "").strip()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -156,6 +158,7 @@ class RunMeltanoPipelineRequest(BaseModel):
     source_schema: Optional[str] = "public"
     dest_table: Optional[str] = None
     dest_schema: Optional[str] = "public"
+    column_renames: Optional[Dict[str, str]] = None  # { source_col: dest_col } for table-to-table mapping
     sync_mode: Literal["full", "incremental"] = "full"
     write_mode: Literal["append", "upsert", "replace"] = "upsert"
     upsert_key: Optional[List[str]] = None
@@ -261,8 +264,8 @@ async def discover_schema(
 
     source_config = {
         **payload.source_config,
-        **({"table": payload.table_name} if payload.table_name else {}),
-        **({"schema": payload.schema_name} if payload.schema_name else {}),
+        **({"table": payload.table_name, "table_name": payload.table_name} if payload.table_name else {}),
+        **({"schema": payload.schema_name, "schema_name": payload.schema_name} if payload.schema_name else {}),
         **({"query": payload.query} if payload.query else {}),
     }
 
@@ -422,7 +425,9 @@ async def _run_and_callback(payload: RunMeltanoPipelineRequest) -> None:
             sync_mode=payload.sync_mode,
             dbt_models=payload.dbt_models,
             source_table=payload.source_table,
+            source_schema=payload.source_schema,
             dest_table=payload.dest_table,
+            column_renames=payload.column_renames,
             timeout_seconds=TAP_TIMEOUT_SECONDS,
             meltano_job_id=meltano_job_id,
         )
@@ -437,10 +442,16 @@ async def _run_and_callback(payload: RunMeltanoPipelineRequest) -> None:
         user_message = getattr(exc, "user_message", None) or error_message
 
     if callback_url:
+        # ETL_CALLBACK_BASE_URL overrides when ETL runs in Docker (cannot reach localhost from API)
+        effective_url = (
+            f"{ETL_CALLBACK_BASE_URL.rstrip('/')}/api/internal/etl-callback"
+            if ETL_CALLBACK_BASE_URL
+            else callback_url
+        )
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                await client.post(
-                    callback_url,
+                resp = await client.post(
+                    effective_url,
                     json={
                         "jobId": job_id,
                         "pgmqMsgId": pgmq_msg_id,
@@ -452,8 +463,14 @@ async def _run_and_callback(payload: RunMeltanoPipelineRequest) -> None:
                     },
                     headers={"X-Internal-Token": callback_token, "Content-Type": "application/json"},
                 )
+                resp.raise_for_status()
         except Exception as cb_exc:
-            etl_log.error("Callback POST failed: %s", cb_exc)
+            etl_log.error(
+                "Callback POST failed: %s (url=%s)",
+                cb_exc,
+                effective_url,
+                exc_info=True,
+            )
 
 
 @app.post("/run-meltano-pipeline")
@@ -521,7 +538,9 @@ async def run_meltano_pipeline(
             sync_mode=payload.sync_mode,
             dbt_models=payload.dbt_models,
             source_table=payload.source_table,
+            source_schema=payload.source_schema,
             dest_table=payload.dest_table,
+            column_renames=payload.column_renames,
             timeout_seconds=TAP_TIMEOUT_SECONDS,
             meltano_job_id=payload.meltano_job_id,
         )
