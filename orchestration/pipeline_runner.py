@@ -77,6 +77,7 @@ async def run_pipeline_job(
     source_table: Optional[str] = None,
     dest_table: Optional[str] = None,
     timeout_seconds: int = 3600,
+    meltano_job_id: Optional[str] = None,
 ) -> PipelineRunResult:
     """Run a Meltano pipeline job with dynamic connection config.
 
@@ -103,12 +104,16 @@ async def run_pipeline_job(
     run_args: list[str] = []
     if state_id:
         run_args.extend(["--state-id", state_id])
+    else:
+        # No prior state: use full-refresh to avoid tap "state.json: No such file" errors
+        run_args.append("--full-refresh")
 
     result = await run_meltano_job(
         job_name,
         env_overrides=env,
         timeout_seconds=timeout_seconds,
         run_args=run_args if run_args else None,
+        job_id=meltano_job_id,
     )
 
     rows_read, rows_written = _parse_row_counts_from_output(result.stdout, result.stderr)

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Any, Dict, List, Literal, Optional
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -161,6 +163,12 @@ class RunMeltanoPipelineRequest(BaseModel):
     limit: Optional[int] = None
     replication_key: Optional[str] = None
     state_id: Optional[str] = None
+    # Async callback (when present, returns 202 and POSTs result when done)
+    job_id: Optional[str] = None
+    meltano_job_id: Optional[str] = None
+    callback_url: Optional[str] = None
+    callback_token: Optional[str] = None
+    pgmq_msg_id: Optional[int] = None
 
 
 class RunMeltanoPipelineResponse(BaseModel):
@@ -378,13 +386,83 @@ async def collect(
     )
 
 
-@app.post("/run-meltano-pipeline", response_model=RunMeltanoPipelineResponse)
+async def _run_and_callback(payload: RunMeltanoPipelineRequest) -> None:
+    """Background: run meltano, then POST to callback_url."""
+    direction = payload.direction
+    _DIRECTION_MAP = {
+        "postgres-to-postgres": ("postgresql", "postgresql"),
+        "postgres-to-mysql": ("postgresql", "mysql"),
+        "postgres-to-mongodb": ("postgresql", "mongodb"),
+        "mysql-to-postgres": ("mysql", "postgresql"),
+        "mysql-to-mysql": ("mysql", "mysql"),
+        "mysql-to-mongodb": ("mysql", "mongodb"),
+        "mongodb-to-postgres": ("mongodb", "postgresql"),
+        "mongodb-to-mysql": ("mongodb", "mysql"),
+        "mongodb-to-mongodb": ("mongodb", "mongodb"),
+    }
+    source_type, dest_type = _DIRECTION_MAP[direction]
+    job_name = get_job_for_direction(source_type, dest_type)
+    job_id = payload.job_id or payload.meltano_job_id or "unknown"
+    meltano_job_id = payload.meltano_job_id or f"mantrix-{job_id}-{id(payload)}"
+    callback_url = payload.callback_url or ""
+    callback_token = payload.callback_token or ""
+    pgmq_msg_id = payload.pgmq_msg_id or 0
+
+    try:
+        result = await run_pipeline_job(
+            job_name,
+            source_type,
+            payload.source_connection_config,
+            dest_type,
+            payload.dest_connection_config,
+            state_id=payload.state_id,
+            checkpoint=payload.checkpoint,
+            sync_mode=payload.sync_mode,
+            dbt_models=payload.dbt_models,
+            source_table=payload.source_table,
+            dest_table=payload.dest_table,
+            timeout_seconds=TAP_TIMEOUT_SECONDS,
+            meltano_job_id=meltano_job_id,
+        )
+        status = "completed" if result.success else "failed"
+        rows_synced = result.rows_written
+        error_message = None if result.success else (result.user_message or (result.errors[0]["error"] if result.errors else "Pipeline failed"))
+        user_message = result.user_message if not result.success else None
+    except Exception as exc:
+        status = "failed"
+        rows_synced = 0
+        error_message = str(exc)
+        user_message = getattr(exc, "user_message", None) or error_message
+
+    if callback_url:
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                await client.post(
+                    callback_url,
+                    json={
+                        "jobId": job_id,
+                        "pgmqMsgId": pgmq_msg_id,
+                        "status": status,
+                        "rowsSynced": rows_synced,
+                        "stateId": payload.state_id,
+                        "errorMessage": error_message,
+                        "userMessage": user_message,
+                    },
+                    headers={"X-Internal-Token": callback_token, "Content-Type": "application/json"},
+                )
+        except Exception as cb_exc:
+            etl_log.error("Callback POST failed: %s", cb_exc)
+
+
+@app.post("/run-meltano-pipeline")
 async def run_meltano_pipeline(
     payload: RunMeltanoPipelineRequest,
     _token: str = Depends(_require_jwt),
-) -> RunMeltanoPipelineResponse:
+):
     """
-    Run a Meltano pipeline with dynamic connections. Clean Engine: Meltano only, no legacy fallback.
+    Run a Meltano pipeline with dynamic connections.
+    When callback_url is present: returns 202 immediately, runs in background, POSTs callback when done.
+    Otherwise: runs synchronously and returns result.
     """
     direction = payload.direction
     _DIRECTION_MAP = {
@@ -421,6 +499,14 @@ async def run_meltano_pipeline(
         metadata={"job": job_name},
     )
 
+    if payload.callback_url:
+        asyncio.create_task(_run_and_callback(payload))
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={"accepted": True, "jobId": payload.job_id or payload.meltano_job_id or "queued"},
+        )
+
     try:
         result = await run_pipeline_job(
             job_name,
@@ -435,6 +521,7 @@ async def run_meltano_pipeline(
             source_table=payload.source_table,
             dest_table=payload.dest_table,
             timeout_seconds=TAP_TIMEOUT_SECONDS,
+            meltano_job_id=payload.meltano_job_id,
         )
     except Exception as exc:
         msg = str(exc)
@@ -496,11 +583,12 @@ async def test_connection(
     config = payload.model_dump(exclude_none=True)
     connection_config = {k: v for k, v in config.items() if k != "type"}
 
+    test_timeout = int(os.getenv("ETL_TEST_CONNECTION_TIMEOUT_SEC", "60"))
     try:
         await run_discovery(
             source_type,
             connection_config,
-            timeout_seconds=10,
+            timeout_seconds=test_timeout,
         )
         return TestConnectionResponse(success=True, message="Connection successful")
     except Exception as exc:

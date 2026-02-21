@@ -83,6 +83,7 @@ async def run_meltano_job(
     project_dir: Optional[str] = None,
     timeout_seconds: int = DEFAULT_JOB_TIMEOUT_SECONDS,
     run_args: Optional[Sequence[str]] = None,
+    job_id: Optional[str] = None,
 ) -> MeltanoRunResult:
     """Execute `meltano run [run_args...] <job_name>` with dynamic env overrides.
 
@@ -97,7 +98,9 @@ async def run_meltano_job(
         MeltanoRunResult with exit_code, stdout, stderr, and inferred user_message.
     """
     env_overrides = env_overrides or {}
-    run_args = run_args or ()
+    run_args = list(run_args) if run_args else []
+    if job_id:
+        run_args.extend(["--job-id", job_id])
     base_dir = project_dir or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     work_dir = base_dir if os.path.isfile(os.path.join(base_dir, "meltano.yml")) else os.getcwd()
 

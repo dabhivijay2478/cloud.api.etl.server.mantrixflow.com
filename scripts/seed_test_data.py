@@ -4,6 +4,8 @@ Seed realistic mock data into PostgreSQL, MySQL, and MongoDB for pipeline testin
 Simulates real-world scenarios: users, orders, products, customers.
 Run after docker-compose.test.yml databases are up.
 Uses ports: Postgres 15432, MySQL 13306, MongoDB 27018
+
+Set SEED_COUNT=1000 for migration/load testing (default: 20 users, 15 products, 10 customers).
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PG_PORT = int(os.getenv("PG_TEST_PORT", "15432"))
 MYSQL_PORT = int(os.getenv("MYSQL_TEST_PORT", "13306"))
 MONGO_PORT = int(os.getenv("MONGO_TEST_PORT", "27018"))
+SEED_COUNT = int(os.getenv("SEED_COUNT", "1000"))  # 1000 for migration/load testing; use 20 for quick tests
 
 # Realistic mock data for users (name, email)
 MOCK_USERS = [
@@ -78,12 +81,43 @@ MOCK_CUSTOMERS = [
 ]
 
 
+def _generate_users(n: int) -> list[tuple[str, str]]:
+    """Generate n users from MOCK_USERS template (cycled)."""
+    out = []
+    for i in range(n):
+        base = MOCK_USERS[i % len(MOCK_USERS)]
+        name, email_base = base[0], base[1].split("@")[0]
+        out.append((f"{name} #{i+1}", f"{email_base}+{i+1}@acme.com"))
+    return out
+
+
+def _generate_products(n: int) -> list[tuple[str, str, float]]:
+    """Generate n products from MOCK_PRODUCTS template (cycled)."""
+    out = []
+    for i in range(n):
+        base = MOCK_PRODUCTS[i % len(MOCK_PRODUCTS)]
+        out.append((f"{base[0]} #{i+1}", f"SKU-{i+1:05d}", base[2] * (1 + (i % 10) / 100)))
+    return out
+
+
+def _generate_customers(n: int) -> list[tuple[str, str, float]]:
+    """Generate n customers from MOCK_CUSTOMERS template (cycled)."""
+    out = []
+    for i in range(n):
+        base = MOCK_CUSTOMERS[i % len(MOCK_CUSTOMERS)]
+        out.append((f"{base[0]} #{i+1}", f"{base[1].split('@')[0]}+{i+1}@customer.com", base[2] + (i * 10)))
+    return out
+
+
 def seed_postgres(host: str = "localhost", port: int = PG_PORT) -> None:
     from sqlalchemy import text
     from sqlalchemy import create_engine
 
     url = f"postgresql://testuser:testpass@{host}:{port}/testdb"
     engine = create_engine(url)
+
+    users = _generate_users(SEED_COUNT)
+    n_orders = min(SEED_COUNT * 2, 2000)  # Cap orders for large seeds
 
     with engine.begin() as conn:
         conn.execute(text("""
@@ -105,26 +139,26 @@ def seed_postgres(host: str = "localhost", port: int = PG_PORT) -> None:
         """))
         conn.execute(text("DELETE FROM test_orders"))
         conn.execute(text("DELETE FROM test_users"))
-        base_date = datetime(2024, 1, 1)
-        for i, (name, email) in enumerate(MOCK_USERS, start=1):
+        for i, (name, email) in enumerate(users, start=1):
             conn.execute(
                 text("INSERT INTO test_users (id, name, email, age) VALUES (:id, :name, :email, :age)"),
                 {"id": i, "name": name, "email": email, "age": 25 + (i % 45)},
             )
-        # Realistic orders: varied amounts, statuses
         order_amounts = [99.99, 149.50, 24.99, 299.00, 45.00, 189.99, 12.50, 450.00, 67.99, 89.00]
         order_statuses = ["completed", "pending", "shipped", "completed", "cancelled", "pending", "completed", "refunded", "shipped", "completed"]
-        for i in range(1, 11):
+        for i in range(1, n_orders + 1):
             conn.execute(
                 text("INSERT INTO test_orders (id, user_id, amount, status) VALUES (:id, :uid, :amt, :status)"),
-                {"id": i, "uid": (i % 5) + 1, "amt": order_amounts[i - 1], "status": order_statuses[i - 1]},
+                {"id": i, "uid": (i % len(users)) + 1, "amt": order_amounts[(i - 1) % 10], "status": order_statuses[(i - 1) % 10]},
             )
     engine.dispose()
-    print("PostgreSQL: seeded test_users and test_orders (realistic mock data)")
+    print(f"PostgreSQL: seeded test_users ({len(users)} rows) and test_orders ({n_orders} rows)")
 
 
 def seed_mysql(host: str = "localhost", port: int = MYSQL_PORT) -> None:
     import pymysql
+
+    products = _generate_products(SEED_COUNT)
 
     conn = pymysql.connect(
         host=host,
@@ -145,8 +179,7 @@ def seed_mysql(host: str = "localhost", port: int = MYSQL_PORT) -> None:
                 )
             """)
             cur.execute("DELETE FROM test_products")
-            for i, (name, sku_prefix, base_price) in enumerate(MOCK_PRODUCTS, start=1):
-                sku = f"{sku_prefix}{i:04d}"
+            for i, (name, sku, base_price) in enumerate(products, start=1):
                 price = round(base_price * (0.95 + (i % 10) / 50), 2)
                 stock = 15 + (i % 85)
                 cur.execute(
@@ -154,7 +187,7 @@ def seed_mysql(host: str = "localhost", port: int = MYSQL_PORT) -> None:
                     (name, sku, price, stock),
                 )
             conn.commit()
-        print("MySQL: seeded test_products (realistic mock data)")
+        print(f"MySQL: seeded test_products ({len(products)} rows)")
     finally:
         conn.close()
 
@@ -163,13 +196,7 @@ def seed_mongodb(host: str = "localhost", port: int = MONGO_PORT) -> None:
     from bson.objectid import ObjectId
     from pymongo import MongoClient
 
-    # Use root credentials; mongo image uses MONGO_INITDB_ROOT_*
-    uri = f"mongodb://testuser:testpass@{host}:{port}/?authSource=admin"
-    client = MongoClient(uri, serverSelectionTimeoutMS=5000)
-    db = client["testdb"]  # Create testdb if not exists
-    col = db["test_customers"]
-    col.delete_many({})
-    # Realistic customer documents - ObjectId _id required for tap-mongodb incremental sync
+    customers = _generate_customers(SEED_COUNT)
     addresses = [
         {"street": "123 Main St", "city": "San Francisco", "state": "CA", "zip": "94102"},
         {"street": "456 Oak Ave", "city": "New York", "state": "NY", "zip": "10001"},
@@ -182,26 +209,32 @@ def seed_mongodb(host: str = "localhost", port: int = MONGO_PORT) -> None:
         {"street": "369 Spruce Way", "city": "Portland", "state": "OR", "zip": "97201"},
         {"street": "741 Ash Ct", "city": "Phoenix", "state": "AZ", "zip": "85001"},
     ]
+
+    uri = f"mongodb://testuser:testpass@{host}:{port}/?authSource=admin"
+    client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+    db = client["testdb"]
+    col = db["test_customers"]
+    col.delete_many({})
     docs = []
-    for i, (name, email, balance) in enumerate(MOCK_CUSTOMERS):
+    for i, (name, email, balance) in enumerate(customers):
         docs.append({
             "_id": ObjectId(),
             "name": name,
             "email": email,
             "balance": balance,
-            "address": addresses[i],
-            "phone": f"+1-555-{100 + i:03d}-{2000 + i:04d}",
+            "address": addresses[i % len(addresses)],
+            "phone": f"+1-555-{100 + (i % 900):03d}-{2000 + i:04d}",
             "tier": "premium" if balance > 1500 else ("standard" if balance > 800 else "basic"),
-            "created_at": (datetime.now(timezone.utc) - timedelta(days=30 - i)).isoformat(),
+            "created_at": (datetime.now(timezone.utc) - timedelta(days=30 - (i % 30))).isoformat(),
         })
     col.insert_many(docs)
     client.close()
-    print("MongoDB: seeded test_customers (realistic mock data, ObjectId _id for tap-mongodb)")
+    print(f"MongoDB: seeded test_customers ({len(docs)} rows, ObjectId _id for tap-mongodb)")
 
 
 def main() -> None:
     host = os.getenv("DB_HOST", "localhost")
-    print(f"Seeding test data (host={host}, pg={PG_PORT}, mysql={MYSQL_PORT}, mongo={MONGO_PORT})")
+    print(f"Seeding test data (host={host}, pg={PG_PORT}, mysql={MYSQL_PORT}, mongo={MONGO_PORT}, count={SEED_COUNT})")
 
     try:
         seed_postgres(host, PG_PORT)

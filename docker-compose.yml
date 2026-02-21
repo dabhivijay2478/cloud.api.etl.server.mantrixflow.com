@@ -13,6 +13,7 @@ services:
       PORT: "8080"
       ETL_AUTH_TOKEN: ${ETL_AUTH_TOKEN:-test-token}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ETL_TEST_CONNECTION_TIMEOUT_SEC: ${ETL_TEST_CONNECTION_TIMEOUT_SEC:-60}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]

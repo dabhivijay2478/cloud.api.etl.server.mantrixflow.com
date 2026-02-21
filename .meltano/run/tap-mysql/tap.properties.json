@@ -1,144 +1,70 @@
 {
   "streams": [
     {
-      "tap_stream_id": "testdb-mongo_to_mysql_customers",
-      "table_name": "mongo_to_mysql_customers",
+      "tap_stream_id": "testdb-test_customers",
+      "table_name": "test_customers",
       "replication_method": "",
-      "key_properties": [],
-      "schema": {
-        "properties": {
-          "name": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "email": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "balance": {
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object",
-        "$schema": "https://json-schema.org/draft/2020-12/schema"
-      },
-      "is_view": false,
-      "stream": "testdb-mongo_to_mysql_customers",
-      "metadata": [
-        {
-          "breadcrumb": [
-            "properties",
-            "name"
-          ],
-          "metadata": {
-            "inclusion": "available",
-            "selected": true
-          }
-        },
-        {
-          "breadcrumb": [
-            "properties",
-            "email"
-          ],
-          "metadata": {
-            "inclusion": "available",
-            "selected": true
-          }
-        },
-        {
-          "breadcrumb": [
-            "properties",
-            "balance"
-          ],
-          "metadata": {
-            "inclusion": "available",
-            "selected": true
-          }
-        },
-        {
-          "breadcrumb": [
-            "properties",
-            "id"
-          ],
-          "metadata": {
-            "inclusion": "available",
-            "selected": true
-          }
-        },
-        {
-          "breadcrumb": [],
-          "metadata": {
-            "inclusion": "available",
-            "table-key-properties": [],
-            "forced-replication-method": "",
-            "schema-name": "testdb",
-            "selected": false
-          }
-        }
+      "key_properties": [
+        "replication_key"
       ],
-      "selected": false
-    },
-    {
-      "tap_stream_id": "testdb-pg_to_mysql_users",
-      "table_name": "pg_to_mysql_users",
-      "replication_method": "",
-      "key_properties": [],
       "schema": {
         "properties": {
-          "age": {
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "created_at": {
+          "cluster_time": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
             ]
           },
-          "email": {
+          "document": {
             "type": [
               "string",
               "null"
             ]
           },
-          "id": {
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "name": {
+          "namespace__database": {
             "type": [
               "string",
               "null"
+            ]
+          },
+          "namespace__collection": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "object_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replication_key": {
+            "type": [
+              "string"
             ]
           }
         },
         "type": "object",
+        "required": [
+          "replication_key"
+        ],
         "$schema": "https://json-schema.org/draft/2020-12/schema"
       },
       "is_view": false,
-      "stream": "testdb-pg_to_mysql_users",
+      "stream": "testdb-test_customers",
       "metadata": [
         {
           "breadcrumb": [
             "properties",
-            "age"
+            "cluster_time"
           ],
           "metadata": {
             "inclusion": "available",
@@ -148,7 +74,7 @@
         {
           "breadcrumb": [
             "properties",
-            "created_at"
+            "document"
           ],
           "metadata": {
             "inclusion": "available",
@@ -158,7 +84,7 @@
         {
           "breadcrumb": [
             "properties",
-            "email"
+            "namespace__database"
           ],
           "metadata": {
             "inclusion": "available",
@@ -168,7 +94,7 @@
         {
           "breadcrumb": [
             "properties",
-            "id"
+            "namespace__collection"
           ],
           "metadata": {
             "inclusion": "available",
@@ -178,10 +104,30 @@
         {
           "breadcrumb": [
             "properties",
-            "name"
+            "object_id"
           ],
           "metadata": {
             "inclusion": "available",
+            "selected": true
+          }
+        },
+        {
+          "breadcrumb": [
+            "properties",
+            "operation_type"
+          ],
+          "metadata": {
+            "inclusion": "available",
+            "selected": true
+          }
+        },
+        {
+          "breadcrumb": [
+            "properties",
+            "replication_key"
+          ],
+          "metadata": {
+            "inclusion": "automatic",
             "selected": true
           }
         },
@@ -189,7 +135,9 @@
           "breadcrumb": [],
           "metadata": {
             "inclusion": "available",
-            "table-key-properties": [],
+            "table-key-properties": [
+              "replication_key"
+            ],
             "forced-replication-method": "",
             "schema-name": "testdb",
             "selected": false
