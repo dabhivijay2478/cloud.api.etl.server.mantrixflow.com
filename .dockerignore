@@ -14,7 +14,6 @@ docker-compose.test.yml
 # Local scripts (Docker uses meltano install from meltano.yml)
 *.sh
 scripts/
-connectors/
 # Keep plugins/ - Meltano lock files for reproducible installs
 
 # IDE and OS

@@ -46,22 +46,14 @@ pip install -r requirements.txt
 
 **Recommended**: Use the project virtual environment so ETL dependencies don't conflict with other tools (e.g. meltano, singer-sdk). Run `./setup.sh` once—it creates `.venv` and installs everything—or create and activate a venv before `pip install -r requirements.txt`. If you see dependency conflicts with `meltano` / `jsonschema` / `singer-sdk`, install inside this project's venv.
 
-### 2. Install Singer Taps
+### 2. Install Meltano and Plugins (Taps/Targets)
 
-The service uses Singer taps for data extraction. Install them from the local connectors directory:
+The service uses Meltano for Singer taps and targets. Install them with:
 
-**Using uv:**
 ```bash
-uv pip install -e connectors/tap-postgres
-uv pip install -e connectors/tap-mysql
-uv pip install -e connectors/tap-mongodb
-```
-
-**Using pip:**
-```bash
-pip install -e connectors/tap-postgres
-pip install -e connectors/tap-mysql
-pip install -e connectors/tap-mongodb
+cd apps/etl
+pip install meltano   # or: pipx install meltano
+meltano install
 ```
 
 ### 3. Configure Environment
@@ -95,8 +87,7 @@ This will:
 - Check Python version (prefers 3.12 or 3.11)
 - Install/check for `uv` (fast Python package manager)
 - Install all Python dependencies
-- Fix tap-postgres to use `psycopg2-binary` (compatible version)
-- Install all Singer taps (tap-postgres, tap-mysql, tap-mongodb)
+- Install Meltano and plugins (tap-postgres, tap-mysql, tap-mongodb, targets)
 
 ### Step 2: Run the Service
 
@@ -254,9 +245,7 @@ Logs are output to stdout. Set `LOG_LEVEL` in `.env` to control verbosity:
 
 If you see errors like "tap-postgres not installed":
 ```bash
-pip install -e connectors/tap-postgres
-pip install -e connectors/tap-mysql
-pip install -e connectors/tap-mongodb
+meltano install
 ```
 
 ### Port Already in Use

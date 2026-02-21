@@ -28,26 +28,8 @@ def check_and_install_dependencies():
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
 
 def check_and_install_taps():
-    """Check and install Singer taps if needed"""
-    base_dir = Path(__file__).parent
-    
-    taps = [
-        ("tap-postgres", "tap_postgres"),
-        ("tap-mysql", "tap_mysql"),
-        ("tap-mongodb", "tap_mongodb"),
-    ]
-    
-    for tap_dir, import_name in taps:
-        tap_path = base_dir / "connectors" / tap_dir
-        if tap_path.exists():
-            try:
-                __import__(import_name)
-                print(f"✓ {tap_dir} installed")
-            except ImportError:
-                print(f"📦 Installing {tap_dir}...")
-                subprocess.check_call([
-                    sys.executable, "-m", "pip", "install", "-e", str(tap_path)
-                ])
+    """Taps are installed via Meltano (meltano install). No local connectors."""
+    pass
 
 def load_env():
     """Load environment variables from .env file"""

@@ -113,73 +113,11 @@ else
 fi
 echo ""
 
-# Step 2: Verify tap-postgres and tap-mongodb setup
-echo -e "${BLUE}Step 2: Verifying tap dependencies...${NC}"
-TAP_POSTGRES_SETUP="$SCRIPT_DIR/connectors/tap-postgres/setup.py"
-if [ -f "$TAP_POSTGRES_SETUP" ]; then
-    if grep -q "psycopg2-binary" "$TAP_POSTGRES_SETUP"; then
-        echo -e "${GREEN}✓ tap-postgres uses psycopg2-binary (correct)${NC}"
-    else
-        echo -e "${YELLOW}⚠ tap-postgres still uses psycopg2 (will be updated)${NC}"
-    fi
-fi
-echo ""
-
-# Step 3: Install Singer taps
-echo -e "${BLUE}Step 3: Installing Singer taps...${NC}"
-
-if [ -d "connectors/tap-postgres" ]; then
-    if ! $PYTHON_CMD -c "import tap_postgres" &> /dev/null; then
-        echo -e "${YELLOW}📦 Installing tap-postgres...${NC}"
-        if uv pip install -e connectors/tap-postgres; then
-            echo -e "${GREEN}✓ tap-postgres installed${NC}"
-        else
-            echo -e "${YELLOW}⚠ uv failed, trying pip...${NC}"
-            $PYTHON_CMD -m pip install -e connectors/tap-postgres
-            echo -e "${GREEN}✓ tap-postgres installed${NC}"
-        fi
-    else
-        echo -e "${GREEN}✓ tap-postgres already installed${NC}"
-    fi
-fi
-
-if [ -d "connectors/tap-mysql" ]; then
-    if ! $PYTHON_CMD -c "import tap_mysql" &> /dev/null; then
-        echo -e "${YELLOW}📦 Installing tap-mysql (requires pendulum from requirements.txt)...${NC}"
-        if [ -n "${VIRTUAL_ENV:-}" ] || [ -f ".venv/bin/python" ]; then
-            $PYTHON_CMD -m pip install -e connectors/tap-mysql
-        elif uv pip install -e connectors/tap-mysql; then
-            true
-        else
-            $PYTHON_CMD -m pip install -e connectors/tap-mysql
-        fi
-        echo -e "${GREEN}✓ tap-mysql installed${NC}"
-    else
-        echo -e "${GREEN}✓ tap-mysql already installed${NC}"
-    fi
-fi
-
-if [ -d "connectors/tap-mongodb" ]; then
-    if ! $PYTHON_CMD -c "import tap_mongodb" &> /dev/null; then
-        echo -e "${YELLOW}📦 Installing tap-mongodb...${NC}"
-        if uv pip install -e connectors/tap-mongodb; then
-            echo -e "${GREEN}✓ tap-mongodb installed${NC}"
-        else
-            echo -e "${YELLOW}⚠ uv failed, trying pip...${NC}"
-            $PYTHON_CMD -m pip install -e connectors/tap-mongodb
-            echo -e "${GREEN}✓ tap-mongodb installed${NC}"
-        fi
-    else
-        echo -e "${GREEN}✓ tap-mongodb already installed${NC}"
-    fi
-fi
-echo ""
-
-# Step 4: Optional Meltano (for static CLI/cron mode)
+# Step 2: Meltano (taps and targets - required for pipelines)
 # Skip with: SKIP_MELTANO=1 ./setup.sh
-echo -e "${BLUE}Step 4: Meltano (optional, for CLI/cron runs)...${NC}"
+echo -e "${BLUE}Step 2: Meltano (taps and targets)...${NC}"
 if [ "${SKIP_MELTANO:-0}" = "1" ]; then
-    echo -e "${YELLOW}  Skipping Meltano (SKIP_MELTANO=1). Dynamic mode works without it.${NC}"
+    echo -e "${YELLOW}  Skipping Meltano (SKIP_MELTANO=1). Pipelines require meltano install.${NC}"
 elif [ -f "meltano.yml" ]; then
     if command -v meltano &> /dev/null; then
         echo -e "${YELLOW}📦 Installing Meltano plugins (tap-postgres, tap-mongodb, target-postgres)...${NC}"

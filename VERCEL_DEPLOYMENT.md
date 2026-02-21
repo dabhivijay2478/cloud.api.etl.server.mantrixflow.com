@@ -19,7 +19,8 @@ This guide explains how to deploy the FastAPI ETL microservice to Vercel using P
 apps/etl/
 ├── api/
 │   └── index.py          # Vercel serverless entrypoint
-├── connectors/           # Singer taps (tap-postgres, tap-mysql, tap-mongodb)
+├── meltano.yml           # Meltano project (taps + targets)
+├── plugins/              # Meltano lock files
 ├── main.py              # FastAPI application
 ├── utils.py             # Utility functions
 ├── requirements.txt     # Python dependencies (includes Mangum)
@@ -37,10 +38,9 @@ cd apps/etl
 # Install Python dependencies
 pip install -r requirements.txt
 
-# Install Singer taps (local connectors)
-pip install -e connectors/tap-postgres
-pip install -e connectors/tap-mysql
-pip install -e connectors/tap-mongodb
+# Install Meltano and plugins (taps + targets)
+pip install meltano
+meltano install
 ```
 
 ### 2. Configure Environment Variables
@@ -195,22 +195,17 @@ If deploying via Dashboard (not CLI), configure:
 2. **Root Directory**: `apps/etl`
 3. **Build Command**: (leave empty - Vercel auto-detects Python)
 4. **Output Directory**: (leave empty)
-5. **Install Command**: `pip install -r requirements.txt && pip install -e connectors/tap-postgres && pip install -e connectors/tap-mysql && pip install -e connectors/tap-mongodb`
+5. **Install Command**: `pip install -r requirements.txt && pip install meltano && meltano install`
 
-**Note**: For Singer taps, you may need to install them during build. Consider:
-- Adding a `build.sh` script
-- Or including tap dependencies in `requirements.txt` if possible
+**Note**: Meltano installs taps and targets into `.meltano/`. Ensure `plugins/` (lock files) is committed.
 
 ## Troubleshooting
 
-### Issue: Import Errors for Connectors
+### Issue: Import Errors for Taps
 
 **Problem**: `ModuleNotFoundError: No module named 'tap_postgres'`
 
-**Solution**: The Singer taps need to be installed. Options:
-1. Install during build (add to build command)
-2. Package taps as proper Python packages
-3. Use a custom build script
+**Solution**: Run `meltano install` to install taps and targets. Ensure the install command includes `meltano install`.
 
 ### Issue: Timeout Errors
 
