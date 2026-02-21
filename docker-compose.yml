@@ -1,9 +1,7 @@
 # ETL Service - Local Docker run
 # Usage: docker compose up -d   (from apps/etl)
 # Health: http://localhost:8001/health
-#
-# Callback URL: When API runs on host, set INTERNAL_API_URL in API .env to
-#   http://host.docker.internal:5000 (Mac/Win) or http://172.17.0.1:5000 (Linux)
+# Callback: ETL uses caller IP automatically (no extra config needed)
 
 services:
   etl:
@@ -20,8 +18,7 @@ services:
       PORT: "8080"
       ETL_AUTH_TOKEN: ${ETL_AUTH_TOKEN:-test-token}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      # Required when ETL runs in Docker: URL the container can reach to callback the API
-      ETL_CALLBACK_BASE_URL: ${ETL_CALLBACK_BASE_URL:-http://host.docker.internal:5000}
+      ETL_CALLBACK_URL: ${ETL_CALLBACK_URL:-http://host.docker.internal:5000/api/internal/etl-callback}
       ETL_TEST_CONNECTION_TIMEOUT_SEC: ${ETL_TEST_CONNECTION_TIMEOUT_SEC:-60}
     restart: unless-stopped
     healthcheck:

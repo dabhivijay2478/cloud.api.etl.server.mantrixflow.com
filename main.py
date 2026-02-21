@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 from typing import Any, Dict, List, Literal, Optional
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 from dotenv import load_dotenv
@@ -35,10 +36,22 @@ load_dotenv()
 APP_NAME = "python-etl"
 APP_VERSION = "2.0.0"
 TAP_TIMEOUT_SECONDS = int(os.getenv("TAP_TIMEOUT_SECONDS", "1200"))
-# When ETL runs in Docker, use this so container can reach API on host (e.g. host.docker.internal:5000)
-ETL_CALLBACK_BASE_URL = os.getenv("ETL_CALLBACK_BASE_URL", "").strip()
-
+# Explicit callback URL ETL can reach (required when ETL/API in different networks, e.g. Fly.io)
+ETL_CALLBACK_URL = os.getenv("ETL_CALLBACK_URL", "").strip()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _build_callback_url(payload_url: str) -> str | None:
+    """Build callback URL: use ETL_CALLBACK_URL if set, else fix path in payload URL."""
+    if ETL_CALLBACK_URL:
+        return ETL_CALLBACK_URL.rstrip("/")
+    if not payload_url:
+        return None
+    parsed = urlparse(payload_url)
+    path = parsed.path or ""
+    if not path.startswith("/api/"):
+        path = "/api" + path if path.startswith("/") else "/api/" + path
+    return urlunparse(parsed._replace(path=path))
 
 
 def _humanize_mysql_auth_error(error_text: str) -> Optional[str]:
@@ -441,36 +454,31 @@ async def _run_and_callback(payload: RunMeltanoPipelineRequest) -> None:
         error_message = str(exc)
         user_message = getattr(exc, "user_message", None) or error_message
 
-    if callback_url:
-        # ETL_CALLBACK_BASE_URL overrides when ETL runs in Docker (cannot reach localhost from API)
-        effective_url = (
-            f"{ETL_CALLBACK_BASE_URL.rstrip('/')}/api/internal/etl-callback"
-            if ETL_CALLBACK_BASE_URL
-            else callback_url
-        )
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    effective_url,
-                    json={
-                        "jobId": job_id,
-                        "pgmqMsgId": pgmq_msg_id,
-                        "status": status,
-                        "rowsSynced": rows_synced,
-                        "stateId": payload.state_id,
-                        "errorMessage": error_message,
-                        "userMessage": user_message,
-                    },
-                    headers={"X-Internal-Token": callback_token, "Content-Type": "application/json"},
-                )
-                resp.raise_for_status()
-        except Exception as cb_exc:
-            etl_log.error(
-                "Callback POST failed: %s (url=%s)",
-                cb_exc,
-                effective_url,
-                exc_info=True,
-            )
+    effective_url = _build_callback_url(callback_url)
+    if effective_url:
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.post(
+                        effective_url,
+                        json={
+                            "jobId": job_id,
+                            "pgmqMsgId": pgmq_msg_id,
+                            "status": status,
+                            "rowsSynced": rows_synced,
+                            "stateId": payload.state_id,
+                            "errorMessage": error_message,
+                            "userMessage": user_message,
+                        },
+                        headers={"X-Internal-Token": callback_token, "Content-Type": "application/json"},
+                    )
+                    resp.raise_for_status()
+                break
+            except Exception as cb_exc:
+                if attempt < 2:
+                    await asyncio.sleep(2.0 * (attempt + 1))
+                else:
+                    etl_log.error("Callback POST failed after 3 attempts: %s (url=%s)", cb_exc, effective_url)
 
 
 @app.post("/run-meltano-pipeline")

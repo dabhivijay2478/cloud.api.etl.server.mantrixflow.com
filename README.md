@@ -246,13 +246,9 @@ Logs are output to stdout. Set `LOG_LEVEL` in `.env` to control verbosity:
 
 ### Callback POST failed: All connection attempts failed
 
-When ETL runs in Docker and the API is on the host, the ETL container cannot reach `localhost`.
-
-1. **API `.env`**: Set `INTERNAL_API_URL=http://host.docker.internal:5000` (Mac/Win) or `http://172.17.0.1:5000` (Linux).
-2. **ETL `.env` or docker-compose**: Set `ETL_CALLBACK_BASE_URL=http://host.docker.internal:5000` so the container uses a reachable URL (overrides payload callback_url).
-
-- **Mac / Windows**: `INTERNAL_API_URL=http://host.docker.internal:5000`
-- **Linux**: `INTERNAL_API_URL=http://172.17.0.1:5000` (or add `extra_hosts: host.docker.internal: host-gateway` to docker-compose and use `host.docker.internal`)
+Set `ETL_CALLBACK_URL` to the API URL the ETL can reach:
+- **Local Docker**: `ETL_CALLBACK_URL=http://host.docker.internal:5000/api/internal/etl-callback`
+- **Fly.io**: `fly secrets set ETL_CALLBACK_URL=https://YOUR_API_APP.fly.dev/api/internal/etl-callback`
 
 Replace `5000` with your API port. See [ETL_JOBS_QUEUE.md](../../apps/api/docs/ETL_JOBS_QUEUE.md) for details.
 
