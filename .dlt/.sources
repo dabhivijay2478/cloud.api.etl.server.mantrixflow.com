@@ -1,0 +1,50 @@
+engine_version: 1
+sources:
+  pg_replication:
+    is_dirty: false
+    last_commit_sha: c838272f958a36437f7e3297fd0bf497956f11a5
+    last_commit_timestamp: '2025-12-09T17:05:43+01:00'
+    files:
+      pg_replication/decoders.py:
+        commit_sha: c838272f958a36437f7e3297fd0bf497956f11a5
+        git_sha: 71ffbdcbd4223107ca4a26ae8c7f4f0e38134f83
+        sha3_256: bd9ad292bf61ad682260529d1a5afdaf0b8243d93ce2643c714928f0ab0c940e
+      pg_replication/__init__.py:
+        commit_sha: c838272f958a36437f7e3297fd0bf497956f11a5
+        git_sha: ef2e2c734db1819cbf6217a094f0d8ad9f0910a2
+        sha3_256: 6229db1a78066ec7583199dec1e5b82fd13957931ca32ba175e980dd76eb3d47
+      pg_replication/README.md:
+        commit_sha: c838272f958a36437f7e3297fd0bf497956f11a5
+        git_sha: 3f669160be076a1b095c63950338defd54a9f9a8
+        sha3_256: 8ea60b2d8925388ad58f291b53087ca60f277015a23b72b18177b47dc08241bf
+      pg_replication/exceptions.py:
+        commit_sha: c838272f958a36437f7e3297fd0bf497956f11a5
+        git_sha: 2b2642777cd0ee58322721c5d0b88aa0b69e8fe3
+        sha3_256: 921d9911a62a41485eac6450483785fb4545d13b0744964936b65a54f2b9ec3f
+      pg_replication/schema_types.py:
+        commit_sha: c838272f958a36437f7e3297fd0bf497956f11a5
+        git_sha: c199407c659b0f890b0889bb6bc8cbb112bc6ea7
+        sha3_256: e5492a0494c8848422df020452571c7800247a4f58113986bc4df04aa7798a27
+      pg_replication/helpers.py:
+        commit_sha: c838272f958a36437f7e3297fd0bf497956f11a5
+        git_sha: 0c300ed00b52bce7eb4219bd096053727dbf3ae6
+        sha3_256: 3df4b796a18b7a5fe1ecae2eb1070b64eae0f7168121f8aa8326bc5c9c1f0ef8
+    dlt_version_constraint: '>=1.0.0'
+  mongodb:
+    is_dirty: false
+    last_commit_sha: c838272f958a36437f7e3297fd0bf497956f11a5
+    last_commit_timestamp: '2025-12-09T17:05:43+01:00'
+    files:
+      mongodb/__init__.py:
+        commit_sha: c838272f958a36437f7e3297fd0bf497956f11a5
+        git_sha: 7b17fe0d9ed90e6796115079f2341e7366247573
+        sha3_256: 11f896962186e0283b64642cc7370b51bc609714efb89b4b6b38f310ba5867c2
+      mongodb/README.md:
+        commit_sha: c838272f958a36437f7e3297fd0bf497956f11a5
+        git_sha: b82785fa42f24f8a37ba1040782f0dcb283937bd
+        sha3_256: 84376b7f78fd7b70c5221d45a52518ecdfe7d7e98363d4a7d136824f256b59d3
+      mongodb/helpers.py:
+        commit_sha: c838272f958a36437f7e3297fd0bf497956f11a5
+        git_sha: f6601f81a1a9b8e29035b427185ef4fce01d2fdd
+        sha3_256: d436534d0a1a3dc38235f4605ab4a85bfb996c3139eed05e70640818817a02eb
+    dlt_version_constraint: '>=0.5.1'

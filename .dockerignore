@@ -1,0 +1,11 @@
+.venv
+.venv-*
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.dlt
+*.duckdb
+.git
+.gitignore
+*.md
