@@ -36,10 +36,17 @@ def discover_schema(source_type: str, body: DiscoverRequest):
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported source type: {source_type}")
 
-        return {
+        out = {
             "columns": result.get("columns", []),
             "primary_keys": result.get("primary_keys", []),
             "estimated_row_count": result.get("estimated_row_count"),
         }
+        if "tables" in result:
+            schema = body.schema_name or "public"
+            out["streams"] = [{"name": f"{schema}.{t}"} for t in result["tables"]]
+        elif "collections" in result:
+            db = conn.get("database", "test")
+            out["streams"] = [{"name": f"{db}.{c}"} for c in result["collections"]]
+        return out
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

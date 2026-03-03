@@ -8,15 +8,23 @@ from typing import Tuple
 
 
 def build_postgres_conn_str(config: dict) -> str:
-    """Build Postgres connection string from config dict."""
+    """Build Postgres connection string from config dict.
+    Adds sslmode=require when ssl.enabled is true (Neon, managed Postgres).
+    """
     if config.get("connection_string"):
-        return config["connection_string"]
-    host = config.get("host", "localhost")
-    port = config.get("port", 5432)
-    database = config.get("database", "postgres")
-    username = config.get("username", "postgres")
-    password = config.get("password", "")
-    return f"postgresql://{username}:{password}@{host}:{port}/{database}"
+        base = config["connection_string"]
+    else:
+        host = config.get("host", "localhost")
+        port = config.get("port", 5432)
+        database = config.get("database", "postgres")
+        username = config.get("username", "postgres")
+        password = config.get("password", "")
+        base = f"postgresql://{username}:{password}@{host}:{port}/{database}"
+    ssl = config.get("ssl") or {}
+    if isinstance(ssl, dict) and ssl.get("enabled"):
+        sep = "&" if "?" in base else "?"
+        base = f"{base}{sep}sslmode=require"
+    return base
 
 
 def build_mongo_conn_url(config: dict) -> str:
