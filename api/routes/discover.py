@@ -2,9 +2,10 @@
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional, Any
+from typing import Optional
 
 from core import dlt_runner
+from core.dlt_runner import DEFAULT_MONGODB_DATABASE
 
 router = APIRouter()
 
@@ -23,6 +24,11 @@ def discover_schema(source_type: str, body: DiscoverRequest):
     """Discover schema (tables/collections, columns) from source."""
     try:
         conn = body.connection_config or body.source_config or {}
+        if not conn or not isinstance(conn, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="Connection config is required and must be a non-empty object",
+            )
         if source_type in ("source-postgres", "postgres", "postgresql"):
             result = dlt_runner.discover_postgres(
                 conn, schema_name=body.schema_name or "public"
@@ -45,8 +51,10 @@ def discover_schema(source_type: str, body: DiscoverRequest):
             schema = body.schema_name or "public"
             out["streams"] = [{"name": f"{schema}.{t}"} for t in result["tables"]]
         elif "collections" in result:
-            db = conn.get("database", "test")
+            db = conn.get("database", DEFAULT_MONGODB_DATABASE)
             out["streams"] = [{"name": f"{db}.{c}"} for c in result["collections"]]
         return out
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

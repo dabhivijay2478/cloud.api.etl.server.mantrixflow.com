@@ -13,8 +13,6 @@ class RunSyncRequest(BaseModel):
     job_id: str
     pipeline_id: str
     organization_id: str
-    source_conn_id: Optional[str] = None
-    dest_conn_id: Optional[str] = None
     source_config: dict
     dest_config: dict
     source_type: str
@@ -25,16 +23,15 @@ class RunSyncRequest(BaseModel):
     write_mode: str = "append"
     upsert_key: Optional[List[str]] = None
     cursor_field: Optional[str] = None
-    column_map: Optional[List[dict]] = None
-    transformations: Optional[List[dict]] = None
-    callback_url: Optional[str] = None
-    callback_token: Optional[str] = None
+    transform_script: Optional[str] = None
     initial_state: Optional[dict] = None
     dataset_name: Optional[str] = None
     dest_schema: Optional[str] = None
     destination_table_exists: Optional[bool] = None
     custom_sql: Optional[str] = None
     transform_type: Optional[str] = None
+    dbt_model: Optional[str] = None
+    selected_columns: Optional[List[str]] = None
 
 
 @router.post("/run-sync")
@@ -45,7 +42,6 @@ def run_sync(body: RunSyncRequest):
             raise HTTPException(status_code=400, detail="source_stream is required")
         dest_table = body.dest_table or body.source_stream.split(".")[-1]
 
-        # When destination_table_exists=True, verify table exists before sync (no auto-create)
         if body.destination_table_exists:
             dest_schema = body.dest_schema or "public"
             if not dlt_runner.verify_destination_table_exists(
@@ -56,9 +52,10 @@ def run_sync(body: RunSyncRequest):
                     detail="Destination table does not exist. Sync only supports existing tables.",
                 )
 
-        # Custom SQL only supported for Postgres source
-        custom_sql = (body.custom_sql or "").strip() if body.custom_sql else None
-        if custom_sql and body.transform_type == "dbt":
+        effective_transform_type = (body.transform_type or "dlt").lower()
+        custom_sql = (body.custom_sql or "").strip() or None
+
+        if effective_transform_type == "dbt" and custom_sql:
             if body.source_type in ("source-mongodb-v2", "mongodb"):
                 raise HTTPException(
                     status_code=400,
@@ -70,15 +67,19 @@ def run_sync(body: RunSyncRequest):
             "dataset_name": body.dataset_name,
             "dest_schema": body.dest_schema,
             "custom_sql": custom_sql,
+            "destination_table_exists": body.destination_table_exists or False,
+            "transform_script": (body.transform_script or "").strip() or None,
+            "transform_type": effective_transform_type,
+            "selected_columns": body.selected_columns,
         }
-        # incremental and cdc both use log-based (Postgres) or cursor-based (MongoDB) incremental
+
         is_incremental = body.sync_mode in ("incremental", "cdc")
-        # Postgres uses WAL (log-based), no cursor; MongoDB uses cursor_field
         cursor_field = (
             (body.cursor_field or "_id")
             if body.source_type in ("source-mongodb-v2", "mongodb")
             else ""
         )
+
         if is_incremental:
             result = dlt_runner.run_incremental_sync(
                 source_type=body.source_type,
@@ -91,7 +92,6 @@ def run_sync(body: RunSyncRequest):
                 write_mode=body.write_mode,
                 upsert_key=body.upsert_key,
                 initial_state=body.initial_state,
-                column_map=body.column_map,
                 **common_kw,
             )
         else:
@@ -104,7 +104,6 @@ def run_sync(body: RunSyncRequest):
                 pipeline_id=body.pipeline_id,
                 write_mode=body.write_mode,
                 upsert_key=body.upsert_key,
-                column_map=body.column_map,
                 **common_kw,
             )
 

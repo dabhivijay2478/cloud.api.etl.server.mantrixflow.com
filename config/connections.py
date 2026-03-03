@@ -2,28 +2,36 @@
 Shared connection builders — single source of truth.
 Used by: core.dlt_runner, api.routes.discover, api.routes.preview, api.routes.sync.
 Avoids duplicate connection logic.
+
+Uses only structured config (host, port, database, username, password, ssl)
+as sent by NestJS — no connection_string/URL. Keeps pooler-friendly URLs
+(no search_path or other options).
 """
 
 from typing import Tuple
+from urllib.parse import quote_plus
 
 
 def build_postgres_conn_str(config: dict) -> str:
-    """Build Postgres connection string from config dict.
-    Adds sslmode=require when ssl.enabled is true (Neon, managed Postgres).
+    """Build Postgres connection string from structured config (NestJS format).
+    Expects: host, port, database, username, password, ssl.enabled
+    No connection_string/URL — only individual credentials.
     """
-    if config.get("connection_string"):
-        base = config["connection_string"]
-    else:
-        host = config.get("host", "localhost")
-        port = config.get("port", 5432)
-        database = config.get("database", "postgres")
-        username = config.get("username", "postgres")
-        password = config.get("password", "")
-        base = f"postgresql://{username}:{password}@{host}:{port}/{database}"
+    host = config.get("host") or config.get("hostname", "localhost")
+    port = config.get("port", 5432)
+    database = config.get("database", "postgres")
+    username = config.get("username") or config.get("user", "postgres")
+    password = config.get("password", "")
+
+    if password and ("@" in password or ":" in password):
+        password = quote_plus(password)
+
+    base = f"postgresql://{username}:{password}@{host}:{port}/{database}"
+
     ssl = config.get("ssl") or {}
     if isinstance(ssl, dict) and ssl.get("enabled"):
-        sep = "&" if "?" in base else "?"
-        base = f"{base}{sep}sslmode=require"
+        base = f"{base}?sslmode=require"
+
     return base
 
 
