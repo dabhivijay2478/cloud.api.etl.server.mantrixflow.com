@@ -8,14 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
-import threading
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -24,13 +25,13 @@ from typing import Any
 import httpx
 
 # Thread pool for sync subprocess fallback (avoids uvloop/Python 3.13 pipe issues)
-_preview_executor: threading.ThreadPoolExecutor | None = None
+_preview_executor: ThreadPoolExecutor | None = None
 
 
-def _get_preview_executor() -> threading.ThreadPoolExecutor:
+def _get_preview_executor() -> ThreadPoolExecutor:
     global _preview_executor
     if _preview_executor is None:
-        _preview_executor = threading.ThreadPoolExecutor(max_workers=4, thread_name_prefix="preview")
+        _preview_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="preview")
     return _preview_executor
 
 from core.config_builder import build_tap_config, build_target_config
@@ -41,7 +42,7 @@ logger = logging.getLogger("etl.runner")
 
 TMPFS_ROOT = Path(tempfile.gettempdir())
 TMPFS_PREFIX = "mxf_"
-PYTHON = "python"
+PYTHON = sys.executable
 # Max chars to capture from subprocess stderr (full tracebacks for connection errors)
 STDERR_MAX_CHARS = 8000
 
@@ -51,7 +52,9 @@ class SingerRunResult:
 
     def __init__(self) -> None:
         self.status: str = "completed"
+        self.rows_read: int = 0
         self.rows_upserted: int = 0
+        self.rows_dropped: int = 0
         self.rows_deleted: int = 0
         self.singer_state: dict[str, Any] | None = None
         self.error: str | None = None
@@ -148,7 +151,11 @@ async def run_sync(
     try:
         work_dir.mkdir(parents=True, exist_ok=True)
 
-        tap_config = build_tap_config(source_connection_config, replication_slot_name)
+        tap_config = build_tap_config(
+            source_connection_config,
+            replication_slot_name,
+            source_type=source_type,
+        )
         target_config = build_target_config(
             dest_connection_config, dest_schema,
             hard_delete=hard_delete,
@@ -156,6 +163,7 @@ async def run_sync(
             dest_table=dest_table,
             emit_method=emit_method,
             upsert_key=upsert_key,
+            dest_type=dest_type,
         )
 
         tap_config_path = work_dir / "tap-config.json"
@@ -253,7 +261,8 @@ async def run_sync(
         )
 
         # Bridge processes: tap.stdout → transformer.stdin → target.stdin
-        record_count = 0
+        tap_record_count = 0
+        transformed_record_count = 0
 
         async def _pipe(reader, writer):
             try:
@@ -269,9 +278,9 @@ async def run_sync(
                 with suppress(Exception):
                     writer.close()
 
-        async def _counting_pipe(reader, writer):
-            """Pipe that counts RECORD messages line-by-line."""
-            nonlocal record_count
+        async def _counting_pipe(reader, writer, counter_name: str):
+            """Pipe that counts Singer RECORD messages line-by-line."""
+            nonlocal tap_record_count, transformed_record_count
             buf = b""
             try:
                 while True:
@@ -285,8 +294,15 @@ async def run_sync(
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
                         line_with_nl = line + b"\n"
-                        if b'"RECORD"' in line or b'"record"' in line:
-                            record_count += 1
+                        try:
+                            payload = json.loads(line)
+                            if payload.get("type", "").upper() == "RECORD":
+                                if counter_name == "tap":
+                                    tap_record_count += 1
+                                else:
+                                    transformed_record_count += 1
+                        except json.JSONDecodeError:
+                            pass
                         writer.write(line_with_nl)
                         await writer.drain()
             except (BrokenPipeError, ConnectionResetError, RuntimeError, OSError):
@@ -304,8 +320,12 @@ async def run_sync(
                 chunks.append(chunk)
             return b"".join(chunks)
 
-        pipe1 = asyncio.create_task(_counting_pipe(tap_proc.stdout, transformer_proc.stdin))
-        pipe2 = asyncio.create_task(_pipe(transformer_proc.stdout, target_proc.stdin))
+        pipe1 = asyncio.create_task(
+            _counting_pipe(tap_proc.stdout, transformer_proc.stdin, "tap")
+        )
+        pipe2 = asyncio.create_task(
+            _counting_pipe(transformer_proc.stdout, target_proc.stdin, "transformer")
+        )
         read_target_out = asyncio.create_task(_read_all(target_proc.stdout))
         read_target_err = asyncio.create_task(_read_all(target_proc.stderr))
 
@@ -337,6 +357,10 @@ async def run_sync(
         if target_stderr:
             logger.info("%s stderr:\n%s", target_exe, target_stderr.decode(errors="replace")[:STDERR_MAX_CHARS])
 
+        result.rows_read = tap_record_count
+        result.rows_upserted = transformed_record_count
+        result.rows_dropped = max(tap_record_count - transformed_record_count, 0)
+
         if tap_proc.returncode != 0:
             err_text = (tap_stderr or b"").decode(errors="replace")[:STDERR_MAX_CHARS]
             result.status = "failed"
@@ -354,11 +378,14 @@ async def run_sync(
             result.error = f"Pipe error: {pipe_error}"
         else:
             _parse_target_output(target_stdout, result)
-            result.rows_upserted = record_count
             result.status = "completed"
             logger.info(
-                "Sync completed: job=%s rows_upserted=%d rows_deleted=%d",
-                job_id, result.rows_upserted, result.rows_deleted,
+                "Sync completed: job=%s rows_read=%d rows_written=%d rows_dropped=%d rows_deleted=%d",
+                job_id,
+                result.rows_read,
+                result.rows_upserted,
+                result.rows_dropped,
+                result.rows_deleted,
             )
 
     except asyncio.CancelledError:
@@ -377,7 +404,9 @@ async def run_sync(
             "pipeline_id": pipeline_id,
             "organization_id": organization_id,
             "status": result.status,
+            "rows_read": result.rows_read,
             "rows_upserted": result.rows_upserted,
+            "rows_dropped": result.rows_dropped,
             "rows_deleted": result.rows_deleted,
             "lsn_end": result.lsn_end,
             "singer_state": result.singer_state,
@@ -411,7 +440,7 @@ async def run_discover(
     work_dir = TMPFS_ROOT / f"{TMPFS_PREFIX}discover_{id(source_connection_config)}"
     try:
         work_dir.mkdir(parents=True, exist_ok=True)
-        tap_config = build_tap_config(source_connection_config)
+        tap_config = build_tap_config(source_connection_config, source_type=source_type)
         config_path = work_dir / "tap-config.json"
         config_path.write_text(json.dumps(tap_config))
 
@@ -449,12 +478,13 @@ async def run_test_connection(
     work_dir = TMPFS_ROOT / f"{TMPFS_PREFIX}test_{id(source_connection_config)}"
     try:
         work_dir.mkdir(parents=True, exist_ok=True)
-        tap_config = build_tap_config(source_connection_config)
+        tap_config = build_tap_config(source_connection_config, source_type=source_type)
         config_path = work_dir / "tap-config.json"
         config_path.write_text(json.dumps(tap_config))
 
+        # --config must come before --test so tap-postgres CLI parses config correctly
         proc = await asyncio.create_subprocess_exec(
-            tap_exe, "--test", "--config", str(config_path),
+            tap_exe, "--config", str(config_path), "--test", "all",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -540,7 +570,7 @@ async def run_preview(
     try:
         work_dir.mkdir(parents=True, exist_ok=True)
 
-        tap_config = build_tap_config(source_connection_config)
+        tap_config = build_tap_config(source_connection_config, source_type=source_type)
         config_path = work_dir / "tap-config.json"
         config_path.write_text(json.dumps(tap_config))
 

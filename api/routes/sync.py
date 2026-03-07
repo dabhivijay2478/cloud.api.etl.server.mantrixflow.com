@@ -18,7 +18,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from core.concurrency import run_semaphore, source_limiter
+from core.config_builder import resolve_target_type, resolve_tap_type
 from core.singer_runner import run_sync, register_task, is_shutting_down
+from core.source_mutation_policy import (
+    SOURCE_DB_MUTATION_POLICY_MESSAGE,
+    are_source_db_mutations_allowed,
+)
 
 logger = logging.getLogger("etl.sync")
 router = APIRouter()
@@ -52,6 +57,12 @@ class SyncRequest(BaseModel):
 
 @router.post("/sync")
 async def sync(body: SyncRequest):
+    try:
+        source_type = resolve_tap_type(body.source_type)
+        dest_type = resolve_target_type(body.dest_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     if body.replication_method.upper() == "INCREMENTAL":
         raise HTTPException(
             status_code=400,
@@ -63,6 +74,8 @@ async def sync(body: SyncRequest):
             status_code=400,
             detail=f"Invalid replication_method: {body.replication_method}. Must be FULL_TABLE or LOG_BASED.",
         )
+    if body.replication_method.upper() == "LOG_BASED" and not are_source_db_mutations_allowed():
+        raise HTTPException(status_code=400, detail=SOURCE_DB_MUTATION_POLICY_MESSAGE)
 
     if is_shutting_down():
         return JSONResponse(
@@ -100,24 +113,6 @@ async def sync(body: SyncRequest):
         body.job_id, body.pipeline_id, body.source_stream,
         body.replication_method, body.dest_schema, body.dest_table,
     )
-
-    source_type = (body.source_type or "postgres").lower()
-    if source_type in ("source-postgres", "postgresql", "pgvector", "redshift"):
-        source_type = "postgres"
-    if source_type != "postgres":
-        raise HTTPException(
-            status_code=400,
-            detail="Only PostgreSQL sources are supported",
-        )
-
-    dest_type = (body.dest_type or "postgres").lower()
-    if dest_type in ("source-postgres", "postgresql", "pgvector", "redshift"):
-        dest_type = "postgres"
-    if dest_type != "postgres":
-        raise HTTPException(
-            status_code=400,
-            detail="Only PostgreSQL destinations are supported",
-        )
 
     task = asyncio.create_task(
         _run_and_release(body, source_host, source_port, source_type, dest_type)

@@ -5,112 +5,31 @@ Connector-type-specific. For postgres: wal_level, wal2json, replication_role, re
 
 from __future__ import annotations
 
-import logging
-
-import psycopg2
-import psycopg2.extras
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from core.config_builder import _extract_common
+from core.connector_support import normalize_source_type
+from core.postgres_admin import (
+    verify_replication_role,
+    verify_replication_test,
+    verify_wal2json,
+    verify_wal_level,
+)
+from core.source_mutation_policy import (
+    SOURCE_DB_MUTATION_POLICY_MESSAGE,
+    are_source_db_mutations_allowed,
+)
 
-logger = logging.getLogger("etl.cdc")
 router = APIRouter()
 
-
-def _normalize_source_type(source_type: str) -> str:
-    t = (source_type or "postgres").lower()
-    if t in ("source-postgres", "postgresql", "pgvector", "redshift"):
-        return "postgres"
-    return "postgres"
-
-
-def _build_conn_params(conn: dict) -> dict:
-    """Build psycopg2 connection params from config."""
-    cfg = _extract_common(conn)
-    params = {
-        "host": cfg.get("host", "localhost"),
-        "port": int(cfg.get("port", 5432)),
-        "user": cfg.get("user", "postgres"),
-        "password": cfg.get("password", ""),
-        "dbname": cfg.get("database", cfg.get("dbname", "postgres")),
-    }
-    if cfg.get("ssl_enable"):
-        params["sslmode"] = "require"
-    return params
-
-
-def _verify_wal_level_postgres(conn: dict) -> dict:
-    """Run SHOW wal_level and return ok if logical."""
-    params = _build_conn_params(conn)
-    try:
-        with psycopg2.connect(**params) as pg:
-            with pg.cursor() as cur:
-                cur.execute("SHOW wal_level")
-                row = cur.fetchone()
-                wal_level = (row[0] or "").strip().lower() if row else ""
-                ok = wal_level == "logical"
-                return {"ok": ok, "wal_level": wal_level or "unknown"}
-    except Exception as e:
-        logger.warning("wal_level check failed: %s", e)
-        return {"ok": False, "wal_level": "error", "error": str(e)}
-
-
-def _verify_wal2json_postgres(conn: dict) -> dict:
-    """Check pg_available_extensions for wal2json."""
-    params = _build_conn_params(conn)
-    try:
-        with psycopg2.connect(**params) as pg:
-            with pg.cursor() as cur:
-                cur.execute(
-                    "SELECT name, installed_version FROM pg_available_extensions WHERE name = 'wal2json'"
-                )
-                row = cur.fetchone()
-                if row and row[1]:
-                    return {"ok": True, "installed_version": row[1]}
-                return {"ok": False, "installed_version": None}
-    except Exception as e:
-        logger.warning("wal2json check failed: %s", e)
-        return {"ok": False, "error": str(e)}
-
-
-def _verify_replication_role_postgres(conn: dict) -> dict:
-    """Attempt replication connection. Requires REPLICATION privilege."""
-    params = _build_conn_params(conn)
-    params["connection_factory"] = psycopg2.extras.LogicalReplicationConnection
-    try:
-        with psycopg2.connect(**params) as pg:
-            return {"ok": True}
-    except Exception as e:
-        logger.warning("replication role check failed: %s", e)
-        return {"ok": False, "error": str(e)}
-
-
-def _verify_replication_test_postgres(conn: dict) -> dict:
-    """Create temp slot, verify, drop. End-to-end replication test."""
-    params = _build_conn_params(conn)
-    slot_name = "mxf_cdc_test_temp"
-    try:
-        # pg_create_logical_replication_slot requires REPLICATION privilege
-        with psycopg2.connect(**params) as pg:
-            with pg.cursor() as cur:
-                cur.execute(
-                    "SELECT * FROM pg_create_logical_replication_slot(%s, 'wal2json')",
-                    (slot_name,),
-                )
-            with pg.cursor() as cur:
-                cur.execute("SELECT pg_drop_replication_slot(%s)", (slot_name,))
-        return {"ok": True}
-    except Exception as e:
-        # Try to drop slot if we created it
-        try:
-            with psycopg2.connect(**params) as pg:
-                with pg.cursor() as cur:
-                    cur.execute("SELECT pg_drop_replication_slot(%s)", (slot_name,))
-        except Exception:
-            pass
-        logger.warning("replication test failed: %s", e)
-        return {"ok": False, "error": str(e)}
+def _require_supported_cdc_source(source_type: str | None) -> str:
+    normalized = normalize_source_type(source_type)
+    if normalized != "postgres":
+        raise HTTPException(
+            status_code=400,
+            detail=f"CDC verification is not implemented for source_type={source_type!r}",
+        )
+    return normalized
 
 
 class CdcVerifyRequest(BaseModel):
@@ -125,20 +44,16 @@ async def cdc_verify(body: CdcVerifyRequest):
     if not config:
         raise HTTPException(status_code=400, detail="connection_config is required")
 
-    source_type = _normalize_source_type(body.source_type or "postgres")
+    _require_supported_cdc_source(body.source_type)
     step = (body.step or "wal_level").lower()
-
-    if source_type != "postgres":
-        raise HTTPException(
-            status_code=400,
-            detail="Only PostgreSQL sources are supported",
-        )
+    if step == "replication_test" and not are_source_db_mutations_allowed():
+        raise HTTPException(status_code=400, detail=SOURCE_DB_MUTATION_POLICY_MESSAGE)
 
     handlers = {
-        "wal_level": _verify_wal_level_postgres,
-        "wal2json": _verify_wal2json_postgres,
-        "replication_role": _verify_replication_role_postgres,
-        "replication_test": _verify_replication_test_postgres,
+        "wal_level": verify_wal_level,
+        "wal2json": verify_wal2json,
+        "replication_role": verify_replication_role,
+        "replication_test": verify_replication_test,
     }
     if step not in handlers:
         raise HTTPException(
@@ -161,20 +76,28 @@ async def cdc_verify_all(body: CdcVerifyAllRequest):
     if not config:
         raise HTTPException(status_code=400, detail="connection_config is required")
 
-    source_type = _normalize_source_type(body.source_type or "postgres")
-
-    if source_type != "postgres":
-        raise HTTPException(
-            status_code=400,
-            detail="Only PostgreSQL sources are supported",
-        )
+    _require_supported_cdc_source(body.source_type)
+    if not are_source_db_mutations_allowed():
+        return {
+            "ok": False,
+            "steps": {
+                "wal_level": verify_wal_level(config),
+                "wal2json": verify_wal2json(config),
+                "replication_role": verify_replication_role(config),
+                "replication_test": {
+                    "ok": False,
+                    "error": SOURCE_DB_MUTATION_POLICY_MESSAGE,
+                },
+            },
+            "overall": "failed",
+        }
 
     steps_order = ["wal_level", "wal2json", "replication_role", "replication_test"]
     handlers = {
-        "wal_level": _verify_wal_level_postgres,
-        "wal2json": _verify_wal2json_postgres,
-        "replication_role": _verify_replication_role_postgres,
-        "replication_test": _verify_replication_test_postgres,
+        "wal_level": verify_wal_level,
+        "wal2json": verify_wal2json,
+        "replication_role": verify_replication_role,
+        "replication_test": verify_replication_test,
     }
     results = {}
     all_ok = True

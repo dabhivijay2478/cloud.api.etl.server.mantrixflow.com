@@ -12,6 +12,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from core.config_builder import resolve_tap_type
 from core.singer_runner import run_discover
 from core.catalog_builder import parse_discovered_streams
 
@@ -52,14 +53,10 @@ async def discover(body: DiscoverRequest):
     if not body.connection_config:
         raise HTTPException(status_code=400, detail="connection_config is required")
 
-    source_type = (body.source_type or "postgres").lower()
-    if source_type in ("source-postgres", "postgresql", "pgvector", "redshift"):
-        source_type = "postgres"
-    if source_type != "postgres":
-        raise HTTPException(
-            status_code=400,
-            detail="Only PostgreSQL sources are supported",
-        )
+    try:
+        source_type = resolve_tap_type(body.source_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     host = body.connection_config.get("host", "?")
     dbname = body.connection_config.get("dbname", body.connection_config.get("database", "?"))

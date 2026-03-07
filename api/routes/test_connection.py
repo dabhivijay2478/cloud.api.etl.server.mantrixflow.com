@@ -1,14 +1,16 @@
 """Test connection — POST /test-connection.
 
-Spawns tap-postgres --test to verify source DB connectivity.
+Uses psycopg2 for a fast SELECT 1 check (~1–2s). Avoids tap-postgres subprocess
+which does full discovery and can exceed 60s for cloud DBs (Neon cold start).
 """
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from core.singer_runner import run_test_connection
+from core.config_builder import resolve_tap_type, test_connection_fast
 
 logger = logging.getLogger("etl.test_connection")
 router = APIRouter()
@@ -27,21 +29,17 @@ async def test_connection(body: TestConnectionRequest):
     if not config:
         raise HTTPException(status_code=400, detail="connection_config is required")
 
-    source_type = (body.source_type or body.type or "postgres").lower()
-    if source_type in ("source-postgres", "postgresql", "pgvector", "redshift"):
-        source_type = "postgres"
-    if source_type != "postgres":
-        raise HTTPException(
-            status_code=400,
-            detail="Only PostgreSQL sources are supported",
-        )
+    try:
+        source_type = resolve_tap_type(body.source_type or body.type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     host = config.get("host", "?")
     port = config.get("port", "?")
     dbname = config.get("dbname", config.get("database", "?"))
     logger.info("Testing connection to %s:%s/%s (source_type: %s)", host, port, dbname, source_type)
 
-    result = await run_test_connection(config, source_type=source_type)
+    result = await asyncio.to_thread(test_connection_fast, config, source_type=source_type)
 
     if result.get("success"):
         logger.info("Connection test PASSED for %s:%s/%s", host, port, dbname)

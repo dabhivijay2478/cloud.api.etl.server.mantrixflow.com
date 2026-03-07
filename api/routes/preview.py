@@ -9,6 +9,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from core.config_builder import resolve_tap_type
 from core.singer_runner import run_preview
 
 logger = logging.getLogger("etl.preview")
@@ -39,14 +40,10 @@ async def preview(body: PreviewRequest):
         body.source_stream, body.limit,
     )
 
-    source_type = (body.source_type or "postgres").lower()
-    if source_type in ("source-postgres", "postgresql", "pgvector", "redshift"):
-        source_type = "postgres"
-    if source_type != "postgres":
-        raise HTTPException(
-            status_code=400,
-            detail="Only PostgreSQL sources are supported",
-        )
+    try:
+        source_type = resolve_tap_type(body.source_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         result = await run_preview(

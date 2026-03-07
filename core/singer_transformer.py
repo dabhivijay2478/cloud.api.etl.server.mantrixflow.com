@@ -114,7 +114,7 @@ def _load_transform_script() -> str:
         return ""
 
 
-def _load_transform_fn() -> Callable[[dict[str, Any]], dict[str, Any]] | None:
+def _load_transform_fn() -> Callable[[dict[str, Any]], dict[str, Any] | None] | None:
     script = _load_transform_script()
     if not script:
         return None
@@ -133,8 +133,8 @@ def transform_record(
     record: dict[str, Any],
     column_map: dict[str, str],
     drop_columns: set[str],
-    transform_fn: Callable[[dict[str, Any]], dict[str, Any]] | None,
-) -> dict[str, Any]:
+    transform_fn: Callable[[dict[str, Any]], dict[str, Any] | None] | None,
+) -> dict[str, Any] | None:
     """Apply column map, drop columns, user transform, preserving _sdc_ columns."""
     sdc_fields = {k: v for k, v in record.items() if k.startswith(SDC_PREFIX)}
     working = {k: v for k, v in record.items() if not k.startswith(SDC_PREFIX)}
@@ -150,27 +150,46 @@ def transform_record(
             working = transform_fn(working)
         except Exception as exc:
             print(f"WARNING: transform() raised: {exc}", file=sys.stderr)
+            return None
+
+        if working is None:
+            return None
+        if not isinstance(working, dict):
+            print(
+                "WARNING: transform() must return dict or None; dropping record",
+                file=sys.stderr,
+            )
+            return None
 
     working.update(sdc_fields)
     return working
 
 
-def _get_transform_output_keys(
-    transform_fn: Callable[[dict[str, Any]], dict[str, Any]],
-) -> list[str] | None:
-    """Get output column names from transform by running it on an empty record."""
-    try:
-        result = transform_fn({})
-        if isinstance(result, dict):
-            return list(result.keys())
-    except Exception:
-        pass
-    return None
+def _allows_null(prop: dict[str, Any]) -> bool:
+    prop_type = prop.get("type")
+    if isinstance(prop_type, list):
+        return "null" in prop_type
+    return prop_type == "null"
+
+
+def _infer_schema_property(value: Any) -> dict[str, Any]:
+    """Infer a permissive Singer property schema from a Python value."""
+    if isinstance(value, bool):
+        return {"type": ["boolean", "null"]}
+    if isinstance(value, int) and not isinstance(value, bool):
+        return {"type": ["integer", "null"]}
+    if isinstance(value, float):
+        return {"type": ["number", "null"]}
+    if isinstance(value, list):
+        return {"type": ["array", "null"]}
+    if isinstance(value, dict):
+        return {"type": ["object", "null"]}
+    return {"type": ["string", "null"]}
 
 
 def _transform_schema(
     schema: dict[str, Any],
-    output_keys: list[str],
+    transformed_record: dict[str, Any],
     output_to_source: dict[str, str],
     column_sql_types: dict[str, str],
 ) -> dict[str, Any]:
@@ -181,20 +200,31 @@ def _transform_schema(
     Preserves _sdc_* properties from the original schema if present.
     """
     properties: dict[str, Any] = {}
+    required: list[str] = []
     orig_props = schema.get("properties") or {}
+    orig_required = set(schema.get("required") or [])
+    output_keys = [k for k in transformed_record.keys() if not k.startswith(SDC_PREFIX)]
+
     for key in output_keys:
         src_col = output_to_source.get(key)
         if src_col and src_col in orig_props:
             prop = dict(orig_props[src_col])
         else:
-            prop = {"type": ["string", "null"]}
+            prop = _infer_schema_property(transformed_record.get(key))
         if key in column_sql_types:
             prop["x-sql-datatype"] = column_sql_types[key]
         properties[key] = prop
+        if src_col and src_col in orig_required and not _allows_null(prop):
+            required.append(key)
     for k, v in orig_props.items():
         if k.startswith(SDC_PREFIX):
             properties[k] = v
-    return {**schema, "properties": properties}
+    new_schema = {**schema, "properties": properties}
+    if required:
+        new_schema["required"] = required
+    else:
+        new_schema.pop("required", None)
+    return new_schema
 
 
 def _map_key_properties(
@@ -223,12 +253,11 @@ def run() -> None:
     column_sql_types = _load_column_sql_types()
     upsert_key = _load_upsert_key()
     transform_fn = _load_transform_fn()
-    transform_output_keys: list[str] | None = None
     output_to_source: dict[str, str] = {}
     if transform_fn:
-        transform_output_keys = _get_transform_output_keys(transform_fn)
-        if transform_output_keys:
-            output_to_source = _parse_transform_output_mappings(_load_transform_script())
+        output_to_source = _parse_transform_output_mappings(_load_transform_script())
+
+    pending_schema_by_stream: dict[str, dict[str, Any]] = {}
 
     for line in sys.stdin:
         line = line.strip()
@@ -242,29 +271,48 @@ def run() -> None:
             continue
 
         msg_type = msg.get("type", "").upper()
+        stream_name = msg.get("stream") or "__default__"
 
         if msg_type == "RECORD":
-            msg["record"] = transform_record(
+            transformed_record = transform_record(
                 msg.get("record", {}), column_map, drop_columns, transform_fn
             )
-        elif msg_type == "SCHEMA":
-            if transform_output_keys:
-                schema = msg.get("schema", {})
-                msg["schema"] = _transform_schema(
-                    schema, transform_output_keys, output_to_source, column_sql_types
+            if transformed_record is None:
+                continue
+            msg["record"] = transformed_record
+            if transform_fn and stream_name in pending_schema_by_stream:
+                schema_msg = pending_schema_by_stream.pop(stream_name)
+                schema = schema_msg.get("schema", {})
+                schema_msg["schema"] = _transform_schema(
+                    schema,
+                    transformed_record,
+                    output_to_source,
+                    column_sql_types,
                 )
+                output_keys = [k for k in transformed_record.keys() if not k.startswith(SDC_PREFIX)]
                 if upsert_key:
-                    # Only include keys that exist in transformed output (avoids target-postgres error)
-                    msg["key_properties"] = [k for k in upsert_key if k in transform_output_keys]
+                    schema_msg["key_properties"] = [k for k in upsert_key if k in output_keys]
                 else:
-                    original_keys = msg.get("key_properties") or []
-                    msg["key_properties"] = _map_key_properties(
-                        original_keys, output_to_source, transform_output_keys
+                    original_keys = schema_msg.get("key_properties") or []
+                    schema_msg["key_properties"] = _map_key_properties(
+                        original_keys,
+                        output_to_source,
+                        output_keys,
                     )
-            elif upsert_key:
-                # No transform: filter by schema properties to avoid invalid key_properties
+                sys.stdout.write(json.dumps(schema_msg, separators=(",", ":")) + "\n")
+                sys.stdout.flush()
+        elif msg_type == "SCHEMA":
+            if transform_fn:
+                pending_schema_by_stream[stream_name] = msg
+                continue
+            if upsert_key:
                 schema_props = (msg.get("schema") or {}).get("properties") or {}
                 msg["key_properties"] = [k for k in upsert_key if k in schema_props]
+            if column_sql_types:
+                schema_props = (msg.get("schema") or {}).get("properties") or {}
+                for key, sql_type in column_sql_types.items():
+                    if key in schema_props:
+                        schema_props[key]["x-sql-datatype"] = sql_type
 
         sys.stdout.write(json.dumps(msg, separators=(",", ":")) + "\n")
         sys.stdout.flush()
