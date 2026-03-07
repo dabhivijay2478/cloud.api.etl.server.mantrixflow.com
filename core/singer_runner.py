@@ -117,6 +117,8 @@ async def run_sync(
     dest_table: str,
     dest_schema: str = "public",
     replication_slot_name: str | None = None,
+    source_type: str = "postgres",
+    dest_type: str = "postgres",
     column_map: dict[str, str] | None = None,
     drop_columns: list[str] | None = None,
     transform_script: str | None = None,
@@ -135,8 +137,8 @@ async def run_sync(
     result = SingerRunResult()
     start = time.monotonic()
     work_dir = TMPFS_ROOT / f"{TMPFS_PREFIX}{job_id}"
-    tap_exe = get_tap_executable("postgres")
-    target_exe = get_target_executable("postgres")
+    tap_exe = get_tap_executable(source_type)
+    target_exe = get_target_executable(dest_type)
 
     logger.info(
         "Starting sync: job=%s pipeline=%s stream=%s method=%s dest=%s.%s",
@@ -167,7 +169,9 @@ async def run_sync(
         if discovered_catalog:
             catalog = build_catalog(discovered_catalog, source_stream, replication_method)
         else:
-            catalog = await _run_discover(tap_config_path, source_stream, replication_method)
+            catalog = await _run_discover(
+                tap_config_path, source_stream, replication_method, source_type=source_type
+            )
 
         selected_count = sum(
             1 for s in catalog.get("streams", [])
@@ -381,6 +385,7 @@ async def run_sync(
             "duration_seconds": result.duration_seconds,
             "source_tool": tap_exe,
             "dest_tool": target_exe,
+            "replication_method_used": replication_method,
         }
         await post_callback(nestjs_callback_url, callback_payload)
 
@@ -395,9 +400,10 @@ async def run_sync(
 
 async def run_discover(
     source_connection_config: dict[str, Any],
+    source_type: str = "postgres",
 ) -> dict[str, Any]:
     """Run tap --discover and return the raw catalog JSON."""
-    tap_exe = get_tap_executable("postgres")
+    tap_exe = get_tap_executable(source_type)
     host = source_connection_config.get("host", "?")
     dbname = source_connection_config.get("dbname", source_connection_config.get("database", "?"))
     logger.info("Running %s --discover for %s/%s", tap_exe, host, dbname)
@@ -431,9 +437,10 @@ async def run_discover(
 
 async def run_test_connection(
     source_connection_config: dict[str, Any],
+    source_type: str = "postgres",
 ) -> dict[str, Any]:
     """Run tap --test and return success/error."""
-    tap_exe = get_tap_executable("postgres")
+    tap_exe = get_tap_executable(source_type)
     host = source_connection_config.get("host", "?")
     port = source_connection_config.get("port", "?")
     dbname = source_connection_config.get("dbname", source_connection_config.get("database", "?"))
@@ -525,9 +532,10 @@ async def run_preview(
     column_map: dict[str, str] | None = None,
     drop_columns: list[str] | None = None,
     transform_script: str | None = None,
+    source_type: str = "postgres",
 ) -> dict[str, Any]:
     """Run tap in FULL_TABLE mode piped through transformer, collect N records."""
-    logger.info("Running preview: stream=%s limit=%d", source_stream, limit)
+    logger.info("Running preview: stream=%s limit=%d source_type=%s", source_stream, limit, source_type)
     work_dir = TMPFS_ROOT / f"{TMPFS_PREFIX}preview_{id(source_connection_config)}"
     try:
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -537,11 +545,13 @@ async def run_preview(
         config_path.write_text(json.dumps(tap_config))
 
         # Discover then build catalog
-        catalog = await _run_discover(config_path, source_stream, "FULL_TABLE")
+        catalog = await _run_discover(
+            config_path, source_stream, "FULL_TABLE", source_type=source_type
+        )
         catalog_path = work_dir / "catalog.json"
         catalog_path.write_text(json.dumps(catalog))
 
-        tap_exe = get_tap_executable("postgres")
+        tap_exe = get_tap_executable(source_type)
 
         transformer_env = dict(os.environ)
         if column_map:

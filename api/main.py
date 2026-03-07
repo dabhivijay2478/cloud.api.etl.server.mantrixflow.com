@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import health, test_connection, discover, preview, sync, introspect_table
+from api.routes import health, test_connection, discover, preview, sync, introspect_table, cdc_verify, cleanup
 from core.singer_runner import cleanup_stale_tmpfs, drain_running_pipelines
 
 logging.basicConfig(
@@ -72,3 +72,5 @@ app.include_router(discover.router, tags=["discover"])
 app.include_router(preview.router, tags=["preview"])
 app.include_router(sync.router, tags=["sync"])
 app.include_router(introspect_table.router, tags=["introspect"])
+app.include_router(cdc_verify.router, tags=["cdc"])
+app.include_router(cleanup.router, tags=["cleanup"])

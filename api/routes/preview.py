@@ -39,6 +39,15 @@ async def preview(body: PreviewRequest):
         body.source_stream, body.limit,
     )
 
+    source_type = (body.source_type or "postgres").lower()
+    if source_type in ("source-postgres", "postgresql", "pgvector", "redshift"):
+        source_type = "postgres"
+    if source_type != "postgres":
+        raise HTTPException(
+            status_code=400,
+            detail="Only PostgreSQL sources are supported",
+        )
+
     try:
         result = await run_preview(
             source_connection_config=config,
@@ -47,6 +56,7 @@ async def preview(body: PreviewRequest):
             column_map=body.column_map,
             drop_columns=body.drop_columns,
             transform_script=body.transform_script,
+            source_type=source_type,
         )
     except RuntimeError as exc:
         logger.error("Preview failed for stream %s: %s", body.source_stream, exc)

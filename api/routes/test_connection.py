@@ -16,6 +16,7 @@ router = APIRouter()
 
 class TestConnectionRequest(BaseModel):
     source_type: str | None = None
+    type: str | None = None  # Alias from NestJS
     connection_config: dict | None = None
     source_config: dict | None = None
 
@@ -26,12 +27,21 @@ async def test_connection(body: TestConnectionRequest):
     if not config:
         raise HTTPException(status_code=400, detail="connection_config is required")
 
+    source_type = (body.source_type or body.type or "postgres").lower()
+    if source_type in ("source-postgres", "postgresql", "pgvector", "redshift"):
+        source_type = "postgres"
+    if source_type != "postgres":
+        raise HTTPException(
+            status_code=400,
+            detail="Only PostgreSQL sources are supported",
+        )
+
     host = config.get("host", "?")
     port = config.get("port", "?")
     dbname = config.get("dbname", config.get("database", "?"))
-    logger.info("Testing connection to %s:%s/%s", host, port, dbname)
+    logger.info("Testing connection to %s:%s/%s (source_type: %s)", host, port, dbname, source_type)
 
-    result = await run_test_connection(config)
+    result = await run_test_connection(config, source_type=source_type)
 
     if result.get("success"):
         logger.info("Connection test PASSED for %s:%s/%s", host, port, dbname)

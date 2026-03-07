@@ -30,6 +30,8 @@ class SyncRequest(BaseModel):
     organization_id: str
     source_connection_config: dict[str, Any]
     dest_connection_config: dict[str, Any]
+    source_type: str | None = None
+    dest_type: str | None = None
     replication_method: str  # FULL_TABLE or LOG_BASED
     source_stream: str
     dest_table: str
@@ -99,15 +101,36 @@ async def sync(body: SyncRequest):
         body.replication_method, body.dest_schema, body.dest_table,
     )
 
+    source_type = (body.source_type or "postgres").lower()
+    if source_type in ("source-postgres", "postgresql", "pgvector", "redshift"):
+        source_type = "postgres"
+    if source_type != "postgres":
+        raise HTTPException(
+            status_code=400,
+            detail="Only PostgreSQL sources are supported",
+        )
+
+    dest_type = (body.dest_type or "postgres").lower()
+    if dest_type in ("source-postgres", "postgresql", "pgvector", "redshift"):
+        dest_type = "postgres"
+    if dest_type != "postgres":
+        raise HTTPException(
+            status_code=400,
+            detail="Only PostgreSQL destinations are supported",
+        )
+
     task = asyncio.create_task(
-        _run_and_release(body, source_host, source_port)
+        _run_and_release(body, source_host, source_port, source_type, dest_type)
     )
     register_task(task)
 
     return {"job_id": body.job_id, "status": "accepted"}
 
 
-async def _run_and_release(body: SyncRequest, source_host: str, source_port: int) -> None:
+async def _run_and_release(
+    body: SyncRequest, source_host: str, source_port: int,
+    source_type: str = "postgres", dest_type: str = "postgres",
+) -> None:
     """Run the sync then release semaphore and source limiter."""
     try:
         await run_sync(
@@ -116,6 +139,8 @@ async def _run_and_release(body: SyncRequest, source_host: str, source_port: int
             organization_id=body.organization_id,
             source_connection_config=body.source_connection_config,
             dest_connection_config=body.dest_connection_config,
+            source_type=source_type,
+            dest_type=dest_type,
             replication_method=body.replication_method.upper(),
             source_stream=body.source_stream,
             dest_table=body.dest_table,

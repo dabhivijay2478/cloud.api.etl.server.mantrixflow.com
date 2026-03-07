@@ -28,9 +28,9 @@ def get_tap_executable(source_type: str = "postgres") -> str:
     """Get tap executable name for source type. Reads from env, no hardcoded defaults.
 
     Env vars (in order of precedence):
-    - TAP_REGISTRY: JSON dict e.g. {"postgres":"tap-postgres","mysql":"tap-mysql"}
+    - TAP_REGISTRY: JSON dict e.g. {"postgres":"tap-postgres"}
     - TAP_POSTGRES: for postgres source (when TAP_REGISTRY not used)
-    - TAP_<UPPER_TYPE>: e.g. TAP_MYSQL for mysql
+    - TAP_<UPPER_TYPE>: e.g. TAP_POSTGRES for postgres
 
     Raises ValueError if not configured.
     """
@@ -56,8 +56,8 @@ def get_target_executable(dest_type: str = "postgres") -> str:
 
     Env vars (in order of precedence):
     - TARGET_REGISTRY: JSON dict e.g. {"postgres":"target-postgres"}
-    - TARGET_POSTGRES: for postgres destination
-    - TARGET_<UPPER_TYPE>: e.g. TARGET_SNOWFLAKE
+    - TARGET_POSTGRES: for postgres destination (only supported target)
+    - TARGET_<UPPER_TYPE>: e.g. TARGET_POSTGRES
 
     Raises ValueError if not configured.
     """

@@ -44,6 +44,7 @@ def _user_friendly_connection_error(exc: BaseException) -> str | None:
 class DiscoverRequest(BaseModel):
     connection_config: dict
     schema_name: str | None = None
+    source_type: str | None = None
 
 
 @router.post("/discover")
@@ -51,18 +52,27 @@ async def discover(body: DiscoverRequest):
     if not body.connection_config:
         raise HTTPException(status_code=400, detail="connection_config is required")
 
+    source_type = (body.source_type or "postgres").lower()
+    if source_type in ("source-postgres", "postgresql", "pgvector", "redshift"):
+        source_type = "postgres"
+    if source_type != "postgres":
+        raise HTTPException(
+            status_code=400,
+            detail="Only PostgreSQL sources are supported",
+        )
+
     host = body.connection_config.get("host", "?")
     dbname = body.connection_config.get("dbname", body.connection_config.get("database", "?"))
     logger.info(
-        "Discovering schema for %s/%s (filter: %s)",
-        host, dbname, body.schema_name or "all",
+        "Discovering schema for %s/%s (filter: %s, source_type: %s)",
+        host, dbname, body.schema_name or "all", source_type,
     )
 
     raw_catalog = None
     last_exc: RuntimeError | None = None
     for attempt in range(2):
         try:
-            raw_catalog = await run_discover(body.connection_config)
+            raw_catalog = await run_discover(body.connection_config, source_type=source_type)
             break
         except RuntimeError as exc:
             last_exc = exc
