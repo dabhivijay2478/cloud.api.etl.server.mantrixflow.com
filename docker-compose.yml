@@ -1,9 +1,9 @@
 services:
-  new-etl:
+  etl:
     build: .
     ports:
       - "8000:8000"
     environment:
       - PYTHONUNBUFFERED=1
-      # LOG_LEVEL: debug | info | warning | error (debug = all logs)
-      - LOG_LEVEL=debug
+      - MAX_CONCURRENT_RUNS=20
+      - MAX_TAPS_PER_SOURCE=3

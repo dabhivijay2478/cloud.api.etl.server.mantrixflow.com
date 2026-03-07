@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mantrixflow-etl
+  labels:
+    app: mantrixflow-etl
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mantrixflow-etl
+  template:
+    metadata:
+      labels:
+        app: mantrixflow-etl
+    spec:
+      terminationGracePeriodSeconds: 600
+      containers:
+        - name: etl
+          image: mantrixflow-etl:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: MAX_CONCURRENT_RUNS
+              value: "20"
+            - name: MAX_TAPS_PER_SOURCE
+              value: "3"
+            - name: NESTJS_API_URL
+              value: "http://api-service:3000"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 5

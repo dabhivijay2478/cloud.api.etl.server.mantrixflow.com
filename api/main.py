@@ -1,17 +1,44 @@
-"""
-MANTrixFlow ETL — dlt Data Load Tool
-Sources: PostgreSQL, MongoDB | Destination: PostgreSQL
-"""
+"""MANTrixFlow ETL Server — Singer-based tap-postgres -> transformer -> target-postgres."""
 
-from fastapi import FastAPI
+from __future__ import annotations
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import logging
+import time
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import health, connectors, discover, preview, sync, test_connection
+from api.routes import health, test_connection, discover, preview, sync, introspect_table
+from core.singer_runner import cleanup_stale_tmpfs, drain_running_pipelines
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("etl")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("ETL server starting up")
+    cleanup_stale_tmpfs()
+    yield
+    logger.info("ETL server shutting down — draining pipelines")
+    await drain_running_pipelines(timeout=300)
+    logger.info("ETL server shutdown complete")
+
 
 app = FastAPI(
-    title="MANTrixFlow ETL",
-    description="dlt-based Collect → Transform → Emit",
-    version="1.0.0",
+    title="MANTrixFlow ETL Server",
+    description="Singer-based ETL: tap-postgres -> transformer -> target-postgres",
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -22,9 +49,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.monotonic()
+    logger.info("%s %s", request.method, request.url.path)
+    response = await call_next(request)
+    elapsed = round((time.monotonic() - start) * 1000)
+    logger.info(
+        "%s %s → %d (%dms)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed,
+    )
+    return response
+
+
 app.include_router(health.router, tags=["health"])
-app.include_router(connectors.router, prefix="/connectors", tags=["connectors"])
+app.include_router(test_connection.router, tags=["test-connection"])
 app.include_router(discover.router, tags=["discover"])
 app.include_router(preview.router, tags=["preview"])
-app.include_router(sync.router, prefix="/sync", tags=["sync"])
-app.include_router(test_connection.router, tags=["test-connection"])
+app.include_router(sync.router, tags=["sync"])
+app.include_router(introspect_table.router, tags=["introspect"])

@@ -1,16 +1,5 @@
-# dlt-specific ignores
-# secrets and credentials
-secrets.toml
-*.secrets.toml
-# ignore pinned profile name
-.dlt/profile-name
-# ignore default working dir
-.dlt/.var
-# ignore default local dir (loaded data)
-_local
-# ignore duckdb
-*.duckdb
-*.wal 
+# Singer vendor repos (cloned, not committed)
+vendor/
 
 # Git repository
 .git/

@@ -1,45 +1,62 @@
-"""Preview first N rows — POST /preview."""
+"""Preview — POST /preview.
+
+Runs tap in FULL_TABLE mode through transformer, collects N records.
+No target, no destination write.
+"""
+
+import logging
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional
 
-from core import dlt_runner
+from core.singer_runner import run_preview
 
+logger = logging.getLogger("etl.preview")
 router = APIRouter()
 
 
 class PreviewRequest(BaseModel):
-    source_type: str
-    source_config: dict
+    connection_config: dict | None = None
+    source_config: dict | None = None
     source_stream: str
-    limit: Optional[int] = 50
+    limit: int = 50
+    column_map: dict[str, str] | None = None
+    drop_columns: list[str] | None = None
+    transform_script: str | None = None
+    source_type: str | None = None
 
 
 @router.post("/preview")
-def preview(body: PreviewRequest):
-    """Preview first N rows from source (no write)."""
+async def preview(body: PreviewRequest):
+    config = body.connection_config or body.source_config or {}
+    if not config:
+        raise HTTPException(status_code=400, detail="connection_config is required")
+    if not body.source_stream:
+        raise HTTPException(status_code=400, detail="source_stream is required")
+
+    logger.info(
+        "Preview requested: stream=%s limit=%d",
+        body.source_stream, body.limit,
+    )
+
     try:
-        conn = body.source_config
-        limit = body.limit or 50
-        stream = body.source_stream
-        if not stream:
-            raise HTTPException(status_code=400, detail="source_stream is required")
+        result = await run_preview(
+            source_connection_config=config,
+            source_stream=body.source_stream,
+            limit=body.limit,
+            column_map=body.column_map,
+            drop_columns=body.drop_columns,
+            transform_script=body.transform_script,
+        )
+    except RuntimeError as exc:
+        logger.error("Preview failed for stream %s: %s", body.source_stream, exc)
+        raise HTTPException(status_code=500, detail=str(exc))
 
-        if body.source_type in ("source-postgres", "postgres", "postgresql"):
-            result = dlt_runner.preview_postgres(conn, stream, limit)
-        elif body.source_type in ("source-mongodb-v2", "mongodb"):
-            result = dlt_runner.preview_mongodb(conn, stream, limit)
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported source type: {body.source_type}")
+    logger.info(
+        "Preview complete: stream=%s rows=%d columns=%d",
+        body.source_stream,
+        result.get("total", 0),
+        len(result.get("columns", [])),
+    )
 
-        return {
-            "records": result.get("records", []),
-            "columns": result.get("columns", []),
-            "total": result.get("total", 0),
-            "stream": result.get("stream", stream),
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return result
