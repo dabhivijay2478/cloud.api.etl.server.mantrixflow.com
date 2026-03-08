@@ -1,14 +1,29 @@
 """Build tap-postgres and target-postgres config JSON dicts from connection credentials.
 
-Config key mapping (NestJS -> tap/target):
-- username -> user (both accepted)
-- database / dbname -> database (both accepted)
-- host / hostname -> host (both accepted)
+Single source of truth for ALL PostgreSQL connection resolution in this ETL server.
+Every route and module that needs a DB connection must go through this module.
 
-Supabase host formats:
-- Direct: db.<project-ref>.supabase.co
-- Pooler: aws-0-<region>.pooler.supabase.com (port 5432 session, 6543 transaction)
-- Common typo: b.<ref>.supabase.co -> auto-corrected to db.<ref>.supabase.co
+Connection config fields accepted (all NestJS key variants supported):
+  host / hostname         → host
+  port                    → port             (default: 5432)
+  user / username         → user
+  password                → password
+  database / dbname       → database
+
+SSL — driven entirely by the ``ssl`` field; no host-pattern guessing:
+  ssl: true / "true"      → sslmode=require
+  ssl: false / "false"    → sslmode=disable
+  ssl: {enabled: true}    → sslmode=require
+  ssl: {require: true}    → sslmode=require
+  ssl: absent / null      → sslmode=prefer   (server decides)
+
+Transaction pooler / pgBouncer — driven by explicit config fields:
+  pgbouncer: true                      → disable prepared statements
+  connection_type: "transaction_pooler"→ disable prepared statements
+  (psycopg3 URL gets prepare_threshold=0 so no PREPARE is ever sent)
+
+Optional:
+  connect_timeout          → seconds before giving up (default: 10)
 """
 
 from __future__ import annotations
@@ -18,13 +33,70 @@ from typing import Any
 from urllib.parse import quote_plus
 
 import psycopg2
+
 from core.connector_support import normalize_dest_type, normalize_source_type
 
 logger = logging.getLogger("etl.config")
 
-# Fast connection test timeout (seconds) — avoids tap-postgres subprocess overhead
-TEST_CONNECTION_TIMEOUT_SEC = 10
+# Default timeouts (seconds) — used when the conn dict has no connect_timeout
+_DEFAULT_CONNECT_TIMEOUT = 10
+_DEFAULT_PSYCOPG_TIMEOUT = 15
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SSL field parser
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _parse_ssl(ssl: Any) -> bool | None:
+    """Parse the raw ``ssl`` connection field.
+
+    Returns:
+        True   — SSL explicitly required.
+        False  — SSL explicitly disabled.
+        None   — No setting provided; use sslmode=prefer.
+    """
+    if ssl is None:
+        return None
+    if isinstance(ssl, bool):
+        return ssl
+    if isinstance(ssl, str):
+        v = ssl.strip().lower()
+        if v in ("true", "1", "yes", "on", "require"):
+            return True
+        if v in ("false", "0", "no", "off", "disable"):
+            return False
+        return None
+    if isinstance(ssl, dict):
+        # Explicit disable wins first
+        if ssl.get("enabled") is False or ssl.get("require") is False:
+            return False
+        # Any truthy key means require
+        if any(ssl.get(k) for k in ("enabled", "require", "ca_cert", "client_cert", "client_key")):
+            return True
+        return None  # empty dict → no opinion
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pooler detection — explicit config fields only
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _is_transaction_pooler(conn: dict[str, Any]) -> bool:
+    """Return True when the caller has explicitly flagged a transaction pooler.
+
+    Checks:
+      conn["pgbouncer"] is truthy
+      conn["connection_type"] contains "transaction"  (case-insensitive)
+    """
+    if conn.get("pgbouncer"):
+        return True
+    conn_type = str(conn.get("connection_type") or "").lower()
+    return "transaction" in conn_type
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# URL / DSN builders
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _build_sqlalchemy_url(
     host: str,
@@ -32,107 +104,136 @@ def _build_sqlalchemy_url(
     user: str,
     password: str,
     database: str,
-    ssl_mode: str | None = None,
+    *,
+    needs_ssl: bool,
+    transaction_pooler: bool,
 ) -> str:
-    """Build PostgreSQL SQLAlchemy URL for tap/target config.
+    """Build a SQLAlchemy postgresql:// URL for psycopg3 (Singer SDK driver).
 
-    Uses quote_plus for user and password to handle special characters.
+    Every credential component is percent-encoded.
+    Appends:
+      sslmode=require        when needs_ssl is True
+      sslmode=prefer         when needs_ssl is False (server decides)
+      prepare_threshold=0    when transaction_pooler is True
     """
     user_enc = quote_plus(user)
-    password_enc = quote_plus(password)
-    url = f"postgresql://{user_enc}:{password_enc}@{host}:{port}/{database}"
-    if ssl_mode:
-        url += f"?sslmode={quote_plus(ssl_mode)}"
-    return url
+    pwd_enc = quote_plus(password)
+    db_enc = quote_plus(database)
+
+    sslmode = "require" if needs_ssl else "prefer"
+    params: list[str] = [f"sslmode={sslmode}"]
+    if transaction_pooler:
+        params.append("prepare_threshold=0")
+
+    return f"postgresql://{user_enc}:{pwd_enc}@{host}:{port}/{db_enc}?{'&'.join(params)}"
 
 
-def _normalize_supabase_host(host: str) -> str:
-    """Fix common Supabase host typo: b. -> db. for *.supabase.co hosts."""
-    if not host or not isinstance(host, str):
-        return host
-    # b.<project-ref>.supabase.co is invalid; correct to db.<project-ref>.supabase.co
-    if host.startswith("b.") and ".supabase.co" in host:
-        fixed = "db." + host[2:]
-        logger.info("Normalized Supabase host: %s -> %s", host, fixed)
-        return fixed
-    return host
+def build_psycopg_dsn(conn: dict[str, Any]) -> str:
+    """Build a libpq DSN for direct psycopg3 connections (introspect, admin, etc).
 
+    Uses the same field resolution as _extract_common so every caller gets
+    identical SSL/pooler/encoding behaviour.
+    """
+    cfg = _extract_common(conn)
+    user_enc = quote_plus(cfg["user"])
+    pwd_enc = quote_plus(cfg["password"])
+    db_enc = quote_plus(cfg["database"])
+    sslmode = "require" if cfg["ssl_enable"] else "prefer"
+    timeout = cfg["connect_timeout"]
+
+    params: list[str] = [
+        f"sslmode={sslmode}",
+        f"connect_timeout={timeout}",
+    ]
+    if cfg["transaction_pooler"]:
+        params.append("prepare_threshold=0")
+
+    return (
+        f"postgresql://{user_enc}:{pwd_enc}@{cfg['host']}:{cfg['port']}/{db_enc}"
+        f"?{'&'.join(params)}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core connection resolver  ← everything flows through here
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _extract_common(conn: dict[str, Any]) -> dict[str, Any]:
-    """Extract common PG connection fields from the NestJS decrypted config.
+    """Resolve all PostgreSQL connection fields from the NestJS connection config.
 
-    SSL is determined solely from the stored ssl field (bool, dict, or string).
+    Accepts every key variant the API may send.
+    Returns a canonical dict consumed by tap/target config builders and
+    direct psycopg callers.
+
+    Returned keys:
+      host, port, user, password, database
+      ssl_enable (bool)
+      ssl_mode   ("require" | "prefer")
+      transaction_pooler (bool)
+      connect_timeout (int, seconds)
+      sqlalchemy_url  (str, for Singer subprocess chain)
     """
-    raw_host = conn.get("host") or conn.get("hostname", "localhost")
-    host = _normalize_supabase_host(raw_host)
-    port = int(conn.get("port", 5432))
-    user = conn.get("user") or conn.get("username", "postgres")
-    password = conn.get("password", "")
-    database = conn.get("database") or conn.get("dbname", "postgres")
+    # ── credentials ──────────────────────────────────────────────────────────
+    host = str(conn.get("host") or conn.get("hostname") or "localhost").strip()
+    port = int(conn.get("port") or 5432)
+    user = str(conn.get("user") or conn.get("username") or "postgres").strip()
+    password = str(conn.get("password") or "")
+    database = str(conn.get("database") or conn.get("dbname") or "postgres").strip()
 
-    config: dict[str, Any] = {
+    # ── SSL ───────────────────────────────────────────────────────────────────
+    explicit = _parse_ssl(conn.get("ssl"))
+    needs_ssl: bool = explicit if explicit is not None else False
+    # sslmode=prefer when no opinion → psycopg / libpq tries SSL but falls back
+
+    # ── pooler ────────────────────────────────────────────────────────────────
+    txpool = _is_transaction_pooler(conn)
+
+    # ── connect timeout ───────────────────────────────────────────────────────
+    connect_timeout = int(conn.get("connect_timeout") or _DEFAULT_CONNECT_TIMEOUT)
+
+    cfg: dict[str, Any] = {
         "host": host,
         "port": port,
         "user": user,
         "password": password,
         "database": database,
+        "ssl_enable": needs_ssl,
+        "ssl_mode": "require" if needs_ssl else "prefer",
+        "transaction_pooler": txpool,
+        "connect_timeout": connect_timeout,
+        "sqlalchemy_url": _build_sqlalchemy_url(
+            host, port, user, password, database,
+            needs_ssl=needs_ssl,
+            transaction_pooler=txpool,
+        ),
     }
 
-    # SSL detection: from stored config only (ssl field)
-    ssl = conn.get("ssl")
-    needs_ssl = False
-    if isinstance(ssl, bool):
-        needs_ssl = ssl
-    elif isinstance(ssl, str) and str(ssl).lower() in ("true", "1", "yes"):
-        needs_ssl = True
-    elif isinstance(ssl, dict):
-        needs_ssl = bool(
-            ssl.get("enabled")
-            or ssl.get("ca_cert")
-            or ssl.get("client_cert")
-            or ssl.get("client_key")
-            or ssl.get("require")
-        )
-
-    if needs_ssl:
-        config["ssl_enable"] = True
-        config["ssl_mode"] = "require"
-
-    # sqlalchemy_url is the primary connection method (tap-postgres recommended).
-    # Bypasses CLI callback ordering and config key filtering issues.
-    ssl_mode = "require" if needs_ssl else None
-    config["sqlalchemy_url"] = _build_sqlalchemy_url(
-        host, port, user, password, database, ssl_mode
-    )
-
     logger.info(
-        "Built config: host=%s port=%d user=%s database=%s ssl=%s (input keys: %s)",
-        host, port, user, database, needs_ssl, sorted(conn.keys()),
+        "Built config: host=%s port=%d user=%s database=%s ssl=%s pooler=%s "
+        "(input keys: %s)",
+        host, port, user, database, needs_ssl, txpool, sorted(conn.keys()),
     )
+    return cfg
 
-    return config
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Tap / target config builders
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _build_postgres_tap_config(
     conn: dict[str, Any],
     replication_slot_name: str | None = None,
 ) -> dict[str, Any]:
-    """Build config dict for tap-postgres CLI.
-
-    Uses sqlalchemy_url as primary connection method (tap-postgres recommended).
-    Also includes host, port, user, password, database as fallback.
-    """
+    """Build config dict for the tap-postgres Singer subprocess."""
     config = _extract_common(conn)
-
     if replication_slot_name:
         config["replication_slot_name"] = replication_slot_name
-
     return config
 
 
 def _build_postgres_target_config(
     conn: dict[str, Any],
-    dest_schema: str = "public",
+    dest_schema: str,
     *,
     hard_delete: bool = False,
     source_stream: str | None = None,
@@ -140,28 +241,21 @@ def _build_postgres_target_config(
     emit_method: str = "append",
     upsert_key: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Build config dict for target-postgres CLI.
+    """Build config dict for the target-postgres Singer subprocess.
 
-    When source_stream and dest_table are provided and differ, a stream_maps
-    entry with ``__alias__`` is added so target-postgres writes to the
-    user-selected destination table instead of the Singer stream name.
-
-    Uses sqlalchemy_url as primary connection method (same as tap-postgres).
+    dest_schema and dest_table are passed in at call time — never defaulted here.
+    stream_maps is added when the source stream name differs from the dest table name.
     """
     config = _extract_common(conn)
     config["default_target_schema"] = dest_schema
-    config["add_record_metadata"] = True
-    config["activate_version"] = True
+    config["add_record_metadata"] = False
+    config["activate_version"] = False
     config["hard_delete"] = hard_delete
     config["load_method"] = _map_emit_method_to_load_method(emit_method)
 
     if source_stream and dest_table and source_stream != dest_table:
-        config["stream_maps"] = {
-            source_stream: {"__alias__": dest_table}
-        }
-        logger.info(
-            "stream_maps: '%s' -> '%s'", source_stream, dest_table,
-        )
+        config["stream_maps"] = {source_stream: {"__alias__": dest_table}}
+        logger.info("stream_maps: '%s' -> '%s'", source_stream, dest_table)
 
     return config
 
@@ -177,41 +271,39 @@ def _map_emit_method_to_load_method(emit_method: str) -> str:
 
 
 def _test_postgres_connection_fast(conn: dict[str, Any]) -> dict[str, Any]:
-    """Test PostgreSQL connectivity with psycopg2 (SELECT 1). Completes in <2s typically.
+    """Test connectivity with a quick SELECT 1 via psycopg2.
 
-    Avoids tap-postgres subprocess which does full discovery and can exceed 60s for
-    cloud DBs (Neon cold start, network latency). Use for /test-connection endpoint.
+    Avoids spawning the tap subprocess (which runs full discovery) and
+    completes in well under the NestJS HTTP timeout.
     """
     cfg = _extract_common(conn)
-    host = cfg["host"]
-    port = cfg["port"]
-    user = cfg["user"]
-    password = cfg["password"]
-    database = cfg["database"]
-    needs_ssl = cfg.get("ssl_enable", False)
-    sslmode = "require" if needs_ssl else "prefer"
-
+    sslmode = cfg["ssl_mode"]  # "require" or "prefer"
     try:
         with psycopg2.connect(
-            host=host,
-            port=port,
-            user=user,
-            password=password,
-            dbname=database,
-            connect_timeout=TEST_CONNECTION_TIMEOUT_SEC,
+            host=cfg["host"],
+            port=cfg["port"],
+            user=cfg["user"],
+            password=cfg["password"],
+            dbname=cfg["database"],
+            connect_timeout=cfg["connect_timeout"],
             sslmode=sslmode,
         ) as pg_conn:
             with pg_conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 cur.fetchone()
         return {"success": True}
-    except Exception as e:
-        err = str(e).strip()
-        if not err:
-            err = type(e).__name__
-        logger.warning("Fast connection test failed for %s:%s/%s: %s", host, port, database, err)
+    except Exception as exc:
+        err = str(exc).strip() or type(exc).__name__
+        logger.warning(
+            "Connection test failed for %s:%d/%s: %s",
+            cfg["host"], cfg["port"], cfg["database"], err,
+        )
         return {"success": False, "error": err}
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Connector registries
+# ──────────────────────────────────────────────────────────────────────────────
 
 TAP_CONFIG_BUILDERS = {
     "postgres": _build_postgres_tap_config,
@@ -226,24 +318,26 @@ CONNECTION_TESTERS = {
 }
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Public API
+# ──────────────────────────────────────────────────────────────────────────────
+
 def resolve_tap_type(source_type: str | None = None) -> str:
-    """Normalize and validate a source type against registered tap builders."""
     normalized = normalize_source_type(source_type)
     if normalized not in TAP_CONFIG_BUILDERS:
         supported = ", ".join(sorted(TAP_CONFIG_BUILDERS))
         raise ValueError(
-            f"Unsupported source_type={source_type!r}. Registered tap builders: {supported}"
+            f"Unsupported source_type={source_type!r}. Supported: {supported}"
         )
     return normalized
 
 
 def resolve_target_type(dest_type: str | None = None) -> str:
-    """Normalize and validate a destination type against registered target builders."""
     normalized = normalize_dest_type(dest_type)
     if normalized not in TARGET_CONFIG_BUILDERS:
         supported = ", ".join(sorted(TARGET_CONFIG_BUILDERS))
         raise ValueError(
-            f"Unsupported dest_type={dest_type!r}. Registered target builders: {supported}"
+            f"Unsupported dest_type={dest_type!r}. Supported: {supported}"
         )
     return normalized
 
@@ -254,15 +348,12 @@ def build_tap_config(
     *,
     source_type: str = "postgres",
 ) -> dict[str, Any]:
-    """Build the tap config for the requested registered source type."""
-    normalized = resolve_tap_type(source_type)
-    builder = TAP_CONFIG_BUILDERS[normalized]
-    return builder(conn, replication_slot_name)
+    return TAP_CONFIG_BUILDERS[resolve_tap_type(source_type)](conn, replication_slot_name)
 
 
 def build_target_config(
     conn: dict[str, Any],
-    dest_schema: str = "public",
+    dest_schema: str,
     *,
     hard_delete: bool = False,
     source_stream: str | None = None,
@@ -271,10 +362,7 @@ def build_target_config(
     upsert_key: list[str] | None = None,
     dest_type: str = "postgres",
 ) -> dict[str, Any]:
-    """Build the target config for the requested registered destination type."""
-    normalized = resolve_target_type(dest_type)
-    builder = TARGET_CONFIG_BUILDERS[normalized]
-    return builder(
+    return TARGET_CONFIG_BUILDERS[resolve_target_type(dest_type)](
         conn,
         dest_schema,
         hard_delete=hard_delete,
@@ -290,7 +378,4 @@ def test_connection_fast(
     *,
     source_type: str = "postgres",
 ) -> dict[str, Any]:
-    """Run the registered fast connection test for a source connector."""
-    normalized = resolve_tap_type(source_type)
-    tester = CONNECTION_TESTERS[normalized]
-    return tester(conn)
+    return CONNECTION_TESTERS[resolve_tap_type(source_type)](conn)

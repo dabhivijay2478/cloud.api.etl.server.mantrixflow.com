@@ -15,48 +15,130 @@ STATE messages pass through unchanged.
 
 from __future__ import annotations
 
+import ast
 import base64
 import json
 import os
-import re
 import sys
 from typing import Any, Callable
 
 SDC_PREFIX = "_sdc_"
 
 
+def _extract_record_access_ast(node: ast.expr) -> str | None:
+    """Extract the source column name from a record-access AST node.
+
+    Handles the three common patterns:
+    - ``record.get("col")`` / ``record.get("col", default)``
+    - ``record["col"]``
+    - ``record.col``
+    """
+    # record.get("col") or record.get("col", default)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "record"
+        and node.func.attr == "get"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    ):
+        return node.args[0].value
+
+    # record["col"]
+    if (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "record"
+    ):
+        slice_node = node.slice
+        # Python 3.8 wraps the key in ast.Index; 3.9+ does not.
+        if isinstance(slice_node, ast.Index):  # type: ignore[attr-defined]
+            slice_node = slice_node.value  # type: ignore[attr-defined]
+        if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
+            return slice_node.value
+
+    # record.col
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "record"
+    ):
+        return node.attr
+
+    return None
+
+
 def _parse_transform_output_mappings(script: str) -> dict[str, str]:
-    """Parse transform script to extract output_key -> source_column mappings."""
-    result: dict[str, str] = {}
+    """Parse the transform script with the AST to map output keys → source columns.
+
+    Handles both direct patterns::
+
+        return {"id": record.get("id")}
+
+    And the indirect / intermediate-variable pattern that the old regex missed::
+
+        row_id = record.get("id")
+        return {"id": row_id}
+
+    Returns a dict like ``{"id": "id", "name": "company_name"}``.
+    """
     if not script:
-        return result
+        return {}
     try:
-        match = re.search(r"return\s*\{([^}]*)\}", script, re.DOTALL)
-        if not match:
-            return result
-        body = match.group(1)
-        for m in re.finditer(
-            r'["\']?([a-zA-Z_][a-zA-Z0-9_]*)["\']?\s*:\s*([^,}]+)',
-            body,
-        ):
-            out_key = m.group(1)
-            expr = m.group(2).strip()
-            src = None
-            get_m = re.search(r'record\.get\s*\(\s*["\']([^"\']+)["\']\s*\)', expr)
-            if get_m:
-                src = get_m.group(1)
-            else:
-                bracket_m = re.search(r'record\s*\[\s*["\']([^"\']+)["\']\s*\]', expr)
-                if bracket_m:
-                    src = bracket_m.group(1)
-                else:
-                    dot_m = re.search(r"record\.([a-zA-Z_][a-zA-Z0-9_]*)\b", expr)
-                    if dot_m:
-                        src = dot_m.group(1)
+        tree = ast.parse(script)
+    except SyntaxError:
+        return {}
+
+    result: dict[str, str] = {}
+
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name == "transform"):
+            continue
+
+        # ── Step 1: collect simple variable assignments inside the function ──
+        # e.g.  row_id = record.get("id")  →  var_to_source["row_id"] = "id"
+        var_to_source: dict[str, str] = {}
+        for stmt in ast.walk(node):
+            if not isinstance(stmt, ast.Assign):
+                continue
+            if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+                continue
+            src = _extract_record_access_ast(stmt.value)
             if src:
-                result[out_key] = src
-    except Exception:
-        pass
+                var_to_source[stmt.targets[0].id] = src
+
+        # ── Step 2: find the return dict and map each output key ──
+        for stmt in ast.walk(node):
+            if not isinstance(stmt, ast.Return):
+                continue
+            if not isinstance(stmt.value, ast.Dict):
+                continue
+            for key_node, val_node in zip(stmt.value.keys, stmt.value.values):
+                if key_node is None:
+                    continue
+                if isinstance(key_node, ast.Constant) and isinstance(
+                    key_node.value, str
+                ):
+                    out_key = key_node.value
+                elif isinstance(key_node, ast.Name):
+                    out_key = key_node.id
+                else:
+                    continue
+
+                # Direct: "id": record.get("id")
+                src = _extract_record_access_ast(val_node)
+                if src:
+                    result[out_key] = src
+                    continue
+
+                # Indirect: "id": row_id  (where row_id was assigned from record)
+                if isinstance(val_node, ast.Name) and val_node.id in var_to_source:
+                    result[out_key] = var_to_source[val_node.id]
+
+        break  # Only the first `transform` function matters
+
     return result
 
 
@@ -135,8 +217,11 @@ def transform_record(
     drop_columns: set[str],
     transform_fn: Callable[[dict[str, Any]], dict[str, Any] | None] | None,
 ) -> dict[str, Any] | None:
-    """Apply column map, drop columns, user transform, preserving _sdc_ columns."""
-    sdc_fields = {k: v for k, v in record.items() if k.startswith(SDC_PREFIX)}
+    """Apply column map, drop columns, and user transform.
+
+    _sdc_* Singer metadata fields are stripped from every record — they must
+    never reach the destination table (add_record_metadata is disabled).
+    """
     working = {k: v for k, v in record.items() if not k.startswith(SDC_PREFIX)}
 
     if drop_columns:
@@ -161,7 +246,6 @@ def transform_record(
             )
             return None
 
-    working.update(sdc_fields)
     return working
 
 
@@ -208,7 +292,13 @@ def _transform_schema(
     for key in output_keys:
         src_col = output_to_source.get(key)
         if src_col and src_col in orig_props:
+            # Explicit mapping found (e.g. company_name → name)
             prop = dict(orig_props[src_col])
+        elif key in orig_props:
+            # Same-name fallback: output column kept its original name.
+            # Preserves source type metadata (format: "uuid", x-sql-datatype, …)
+            # even when the AST mapping pass produced no entry for this key.
+            prop = dict(orig_props[key])
         else:
             prop = _infer_schema_property(transformed_record.get(key))
         if key in column_sql_types:
@@ -216,9 +306,6 @@ def _transform_schema(
         properties[key] = prop
         if src_col and src_col in orig_required and not _allows_null(prop):
             required.append(key)
-    for k, v in orig_props.items():
-        if k.startswith(SDC_PREFIX):
-            properties[k] = v
     new_schema = {**schema, "properties": properties}
     if required:
         new_schema["required"] = required
@@ -289,9 +376,13 @@ def run() -> None:
                     output_to_source,
                     column_sql_types,
                 )
-                output_keys = [k for k in transformed_record.keys() if not k.startswith(SDC_PREFIX)]
+                output_keys = [
+                    k for k in transformed_record.keys() if not k.startswith(SDC_PREFIX)
+                ]
                 if upsert_key:
-                    schema_msg["key_properties"] = [k for k in upsert_key if k in output_keys]
+                    schema_msg["key_properties"] = [
+                        k for k in upsert_key if k in output_keys
+                    ]
                 else:
                     original_keys = schema_msg.get("key_properties") or []
                     schema_msg["key_properties"] = _map_key_properties(
@@ -305,6 +396,13 @@ def run() -> None:
             if transform_fn:
                 pending_schema_by_stream[stream_name] = msg
                 continue
+            # Strip _sdc_* metadata columns from the schema — Singer internal
+            # fields (extracted_at, received_at, etc.) must never be forwarded
+            # to the destination table (add_record_metadata is disabled).
+            schema_props = (msg.get("schema") or {}).get("properties")
+            if schema_props:
+                for _sdc_key in [k for k in schema_props if k.startswith(SDC_PREFIX)]:
+                    del schema_props[_sdc_key]
             if upsert_key:
                 schema_props = (msg.get("schema") or {}).get("properties") or {}
                 msg["key_properties"] = [k for k in upsert_key if k in schema_props]

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
@@ -18,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -31,11 +31,14 @@ _preview_executor: ThreadPoolExecutor | None = None
 def _get_preview_executor() -> ThreadPoolExecutor:
     global _preview_executor
     if _preview_executor is None:
-        _preview_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="preview")
+        _preview_executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="preview"
+        )
     return _preview_executor
 
-from core.config_builder import build_tap_config, build_target_config
+
 from core.catalog_builder import build_catalog
+from core.config_builder import build_tap_config, build_target_config
 from core.registry import get_tap_executable, get_target_executable
 
 logger = logging.getLogger("etl.runner")
@@ -100,7 +103,9 @@ async def post_callback(
             resp = await client.post(callback_url, json=payload)
             if resp.status_code >= 400:
                 logger.error(
-                    "Callback POST failed (HTTP %d): %s", resp.status_code, resp.text[:500]
+                    "Callback POST failed (HTTP %d): %s",
+                    resp.status_code,
+                    resp.text[:500],
                 )
             else:
                 logger.info("Callback POST success (HTTP %d)", resp.status_code)
@@ -145,7 +150,12 @@ async def run_sync(
 
     logger.info(
         "Starting sync: job=%s pipeline=%s stream=%s method=%s dest=%s.%s",
-        job_id, pipeline_id, source_stream, replication_method, dest_schema, dest_table,
+        job_id,
+        pipeline_id,
+        source_stream,
+        replication_method,
+        dest_schema,
+        dest_table,
     )
 
     try:
@@ -157,7 +167,8 @@ async def run_sync(
             source_type=source_type,
         )
         target_config = build_target_config(
-            dest_connection_config, dest_schema,
+            dest_connection_config,
+            dest_schema,
             hard_delete=hard_delete,
             source_stream=source_stream,
             dest_table=dest_table,
@@ -175,21 +186,30 @@ async def run_sync(
 
         # Build or use provided catalog
         if discovered_catalog:
-            catalog = build_catalog(discovered_catalog, source_stream, replication_method)
+            catalog = build_catalog(
+                discovered_catalog, source_stream, replication_method
+            )
         else:
             catalog = await _run_discover(
-                tap_config_path, source_stream, replication_method, source_type=source_type
+                tap_config_path,
+                source_stream,
+                replication_method,
+                source_type=source_type,
             )
 
         selected_count = sum(
-            1 for s in catalog.get("streams", [])
+            1
+            for s in catalog.get("streams", [])
             for m in s.get("metadata", [])
-            if m.get("breadcrumb") == [] and m.get("metadata", {}).get("selected") is True
+            if m.get("breadcrumb") == []
+            and m.get("metadata", {}).get("selected") is True
         )
         total_streams = len(catalog.get("streams", []))
         logger.info(
             "Catalog built: source_stream='%s' selected=%d/%d streams",
-            source_stream, selected_count, total_streams,
+            source_stream,
+            selected_count,
+            total_streams,
         )
         if selected_count == 0:
             logger.error(
@@ -210,8 +230,10 @@ async def run_sync(
         # Build subprocess commands
         tap_cmd = [
             tap_exe,
-            "--config", str(tap_config_path),
-            "--catalog", str(catalog_path),
+            "--config",
+            str(tap_config_path),
+            "--catalog",
+            str(catalog_path),
         ]
         if state_path:
             tap_cmd.extend(["--state", str(state_path)])
@@ -234,7 +256,8 @@ async def run_sync(
 
         target_cmd = [
             target_exe,
-            "--config", str(target_config_path),
+            "--config",
+            str(target_config_path),
         ]
 
         # Spawn all three processes with PIPE stdin/stdout.
@@ -351,11 +374,22 @@ async def run_sync(
         transformer_stderr = await _safe_read_stderr(transformer_proc.stderr)
 
         if tap_stderr:
-            logger.info("%s stderr:\n%s", tap_exe, tap_stderr.decode(errors="replace")[:STDERR_MAX_CHARS])
+            logger.info(
+                "%s stderr:\n%s",
+                tap_exe,
+                tap_stderr.decode(errors="replace")[:STDERR_MAX_CHARS],
+            )
         if transformer_stderr:
-            logger.info("transformer stderr:\n%s", transformer_stderr.decode(errors="replace")[:STDERR_MAX_CHARS])
+            logger.info(
+                "transformer stderr:\n%s",
+                transformer_stderr.decode(errors="replace")[:STDERR_MAX_CHARS],
+            )
         if target_stderr:
-            logger.info("%s stderr:\n%s", target_exe, target_stderr.decode(errors="replace")[:STDERR_MAX_CHARS])
+            logger.info(
+                "%s stderr:\n%s",
+                target_exe,
+                target_stderr.decode(errors="replace")[:STDERR_MAX_CHARS],
+            )
 
         result.rows_read = tap_record_count
         result.rows_upserted = transformed_record_count
@@ -366,13 +400,20 @@ async def run_sync(
             result.status = "failed"
             result.error = f"{tap_exe} exited {tap_proc.returncode}: {err_text}"
         elif transformer_proc.returncode != 0:
-            err_text = (transformer_stderr or b"").decode(errors="replace")[:STDERR_MAX_CHARS]
+            err_text = (transformer_stderr or b"").decode(errors="replace")[
+                :STDERR_MAX_CHARS
+            ]
             result.status = "failed"
-            result.error = f"singer_transformer exited {transformer_proc.returncode}: {err_text}"
+            result.error = (
+                f"singer_transformer exited {transformer_proc.returncode}: {err_text}"
+            )
         elif target_proc.returncode != 0:
-            err_text = (target_stderr or b"").decode(errors="replace")[:STDERR_MAX_CHARS]
+            err_text = (target_stderr or b"").decode(errors="replace")[
+                :STDERR_MAX_CHARS
+            ]
             result.status = "failed"
             result.error = f"{target_exe} exited {target_proc.returncode}: {err_text}"
+            result.rows_upserted = 0  # target failed — no rows were actually written
         elif pipe_error:
             result.status = "failed"
             result.error = f"Pipe error: {pipe_error}"
@@ -434,7 +475,9 @@ async def run_discover(
     """Run tap --discover and return the raw catalog JSON."""
     tap_exe = get_tap_executable(source_type)
     host = source_connection_config.get("host", "?")
-    dbname = source_connection_config.get("dbname", source_connection_config.get("database", "?"))
+    dbname = source_connection_config.get(
+        "dbname", source_connection_config.get("database", "?")
+    )
     logger.info("Running %s --discover for %s/%s", tap_exe, host, dbname)
 
     work_dir = TMPFS_ROOT / f"{TMPFS_PREFIX}discover_{id(source_connection_config)}"
@@ -445,7 +488,10 @@ async def run_discover(
         config_path.write_text(json.dumps(tap_config))
 
         proc = await asyncio.create_subprocess_exec(
-            tap_exe, "--config", str(config_path), "--discover",
+            tap_exe,
+            "--config",
+            str(config_path),
+            "--discover",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -453,12 +499,18 @@ async def run_discover(
 
         if proc.returncode != 0:
             err = (stderr or b"").decode(errors="replace")[:STDERR_MAX_CHARS]
-            logger.error("%s --discover failed for %s/%s: %s", tap_exe, host, dbname, err)
-            raise RuntimeError(f"{tap_exe} --discover failed ({proc.returncode}): {err}")
+            logger.error(
+                "%s --discover failed for %s/%s: %s", tap_exe, host, dbname, err
+            )
+            raise RuntimeError(
+                f"{tap_exe} --discover failed ({proc.returncode}): {err}"
+            )
 
         catalog = json.loads(stdout)
         stream_count = len(catalog.get("streams", []))
-        logger.info("Discovery complete for %s/%s: %d stream(s)", host, dbname, stream_count)
+        logger.info(
+            "Discovery complete for %s/%s: %d stream(s)", host, dbname, stream_count
+        )
         return catalog
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -472,7 +524,9 @@ async def run_test_connection(
     tap_exe = get_tap_executable(source_type)
     host = source_connection_config.get("host", "?")
     port = source_connection_config.get("port", "?")
-    dbname = source_connection_config.get("dbname", source_connection_config.get("database", "?"))
+    dbname = source_connection_config.get(
+        "dbname", source_connection_config.get("database", "?")
+    )
     logger.info("Running %s --test for %s:%s/%s", tap_exe, host, port, dbname)
 
     work_dir = TMPFS_ROOT / f"{TMPFS_PREFIX}test_{id(source_connection_config)}"
@@ -484,7 +538,11 @@ async def run_test_connection(
 
         # --config must come before --test so tap-postgres CLI parses config correctly
         proc = await asyncio.create_subprocess_exec(
-            tap_exe, "--config", str(config_path), "--test", "all",
+            tap_exe,
+            "--config",
+            str(config_path),
+            "--test",
+            "all",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -495,7 +553,14 @@ async def run_test_connection(
             return {"success": True}
 
         err = (stderr or b"").decode(errors="replace")[:STDERR_MAX_CHARS]
-        logger.warning("Connection test FAILED for %s:%s/%s (exit %d): %s", host, port, dbname, proc.returncode, err[:500])
+        logger.warning(
+            "Connection test FAILED for %s:%s/%s (exit %d): %s",
+            host,
+            port,
+            dbname,
+            proc.returncode,
+            err[:500],
+        )
         return {"success": False, "error": err}
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -565,7 +630,12 @@ async def run_preview(
     source_type: str = "postgres",
 ) -> dict[str, Any]:
     """Run tap in FULL_TABLE mode piped through transformer, collect N records."""
-    logger.info("Running preview: stream=%s limit=%d source_type=%s", source_stream, limit, source_type)
+    logger.info(
+        "Running preview: stream=%s limit=%d source_type=%s",
+        source_stream,
+        limit,
+        source_type,
+    )
     work_dir = TMPFS_ROOT / f"{TMPFS_PREFIX}preview_{id(source_connection_config)}"
     try:
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -595,13 +665,19 @@ async def run_preview(
 
         try:
             tap_proc = await asyncio.create_subprocess_exec(
-                tap_exe, "--config", str(config_path), "--catalog", str(catalog_path),
+                tap_exe,
+                "--config",
+                str(config_path),
+                "--catalog",
+                str(catalog_path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
 
             transformer_proc = await asyncio.create_subprocess_exec(
-                PYTHON, "-m", "core.singer_transformer",
+                PYTHON,
+                "-m",
+                "core.singer_transformer",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -610,7 +686,9 @@ async def run_preview(
         except (AttributeError, OSError) as exc:
             # uvloop/Python 3.13: StreamReader has no fileno — fall back to sync subprocess
             if "fileno" in str(exc) or isinstance(exc, AttributeError):
-                logger.info("Using sync preview fallback (uvloop/Python 3.13 compatibility)")
+                logger.info(
+                    "Using sync preview fallback (uvloop/Python 3.13 compatibility)"
+                )
                 loop = asyncio.get_event_loop()
                 return await loop.run_in_executor(
                     _get_preview_executor(),
@@ -675,7 +753,9 @@ async def run_preview(
 
         logger.info(
             "Preview complete: stream=%s rows=%d columns=%d",
-            source_stream, len(records), len(columns),
+            source_stream,
+            len(records),
+            len(columns),
         )
 
         return {
@@ -690,6 +770,7 @@ async def run_preview(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 async def _safe_read_stderr(stream) -> bytes:
     """Read remaining stderr from a process, returning empty bytes on failure."""
@@ -710,7 +791,10 @@ async def _run_discover(
     """Run --discover then build a catalog with selected stream."""
     tap_exe = get_tap_executable(source_type)
     proc = await asyncio.create_subprocess_exec(
-        tap_exe, "--config", str(tap_config_path), "--discover",
+        tap_exe,
+        "--config",
+        str(tap_config_path),
+        "--discover",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

@@ -13,18 +13,21 @@ logger = logging.getLogger("etl.postgres_admin")
 
 
 def build_postgres_conn_params(conn: dict) -> dict:
-    """Build psycopg2 connection params from stored connector config."""
+    """Build psycopg2 connection params from stored connector config.
+
+    Uses _extract_common so SSL, timeout, and all field aliases are resolved
+    identically to every other connection in the system.
+    """
     cfg = _extract_common(conn)
-    params = {
-        "host": cfg.get("host", "localhost"),
-        "port": int(cfg.get("port", 5432)),
-        "user": cfg.get("user", "postgres"),
-        "password": cfg.get("password", ""),
-        "dbname": cfg.get("database", cfg.get("dbname", "postgres")),
+    return {
+        "host": cfg["host"],
+        "port": cfg["port"],
+        "user": cfg["user"],
+        "password": cfg["password"],
+        "dbname": cfg["database"],
+        "sslmode": cfg["ssl_mode"],
+        "connect_timeout": cfg["connect_timeout"],
     }
-    if cfg.get("ssl_enable"):
-        params["sslmode"] = "require"
-    return params
 
 
 def verify_wal_level(conn: dict) -> dict:
@@ -35,7 +38,10 @@ def verify_wal_level(conn: dict) -> dict:
                 cur.execute("SHOW wal_level")
                 row = cur.fetchone()
                 wal_level = (row[0] or "").strip().lower() if row else ""
-                return {"ok": wal_level == "logical", "wal_level": wal_level or "unknown"}
+                return {
+                    "ok": wal_level == "logical",
+                    "wal_level": wal_level or "unknown",
+                }
     except Exception as exc:
         logger.warning("wal_level check failed: %s", exc)
         return {"ok": False, "wal_level": "error", "error": str(exc)}
@@ -47,7 +53,8 @@ def verify_wal2json(conn: dict) -> dict:
         with psycopg2.connect(**params) as pg:
             with pg.cursor() as cur:
                 cur.execute(
-                    "SELECT name, installed_version FROM pg_available_extensions WHERE name = 'wal2json'"
+                    "SELECT name, installed_version"
+                    " FROM pg_available_extensions WHERE name = 'wal2json'"
                 )
                 row = cur.fetchone()
                 if row and row[1]:
@@ -83,6 +90,7 @@ def verify_replication_test(conn: dict) -> dict:
                 cur.execute("SELECT pg_drop_replication_slot(%s)", (slot_name,))
         return {"ok": True}
     except Exception as exc:
+        # Best-effort cleanup of the slot we may have just created
         try:
             with psycopg2.connect(**params) as pg:
                 with pg.cursor() as cur:

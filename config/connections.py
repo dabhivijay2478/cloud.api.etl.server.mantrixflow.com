@@ -1,25 +1,42 @@
-"""Shared connection helpers — Postgres only (MongoDB removed)."""
+"""Shared connection helpers — delegates to core.config_builder.
+
+All connection resolution (SSL, URL encoding, pooler detection, timeouts)
+lives in core.config_builder. This module is a thin compatibility shim so
+existing callers of build_postgres_conn_str keep working without changes.
+"""
 
 from __future__ import annotations
 
-from urllib.parse import quote_plus
+from core.config_builder import build_psycopg_dsn
 
 
 def build_postgres_conn_str(config: dict) -> str:
-    """Build a SQLAlchemy-compatible connection string for quick test-connection fallback."""
-    host = config.get("host") or config.get("hostname", "localhost")
-    port = config.get("port", 5432)
-    database = config.get("database", "postgres")
-    username = config.get("username") or config.get("user", "postgres")
-    password = config.get("password", "")
+    """Return a libpq DSN for the given connection config.
 
-    if password and ("@" in password or ":" in password):
-        password = quote_plus(password)
+    Delegates entirely to core.config_builder.build_psycopg_dsn so that
+    SSL mode, URL encoding, pooler flags, and connect_timeout are resolved
+    identically to every other connection in the system.
+    """
+    return build_psycopg_dsn(config)
 
-    base = f"postgresql://{username}:{password}@{host}:{port}/{database}"
 
-    ssl = config.get("ssl") or {}
-    if isinstance(ssl, dict) and ssl.get("enabled"):
-        base = f"{base}?sslmode=require"
+def build_mongo_conn_url(config: dict) -> str:  # noqa: ARG001
+    """Placeholder — MongoDB support removed."""
+    raise NotImplementedError("MongoDB is not supported in this ETL server.")
 
-    return base
+
+def parse_stream(stream: str) -> tuple[str, str]:
+    """Parse 'schema-table' or 'schema.table' into (schema, table).
+
+    Examples
+    --------
+    >>> parse_stream("public-orders")
+    ('public', 'orders')
+    >>> parse_stream("public.orders")
+    ('public', 'orders')
+    """
+    for sep in ("-", "."):
+        if sep in stream:
+            parts = stream.split(sep, 1)
+            return parts[0], parts[1]
+    return "public", stream
