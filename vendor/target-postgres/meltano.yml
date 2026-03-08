@@ -1,0 +1,84 @@
+version: 1
+send_anonymous_usage_stats: true
+default_environment: dev
+project_id: target-postgres
+plugins:
+  extractors:
+  - name: tap-smoke-test
+    variant: meltano
+    pip_url: git+https://github.com/meltano/tap-smoke-test.git
+    executable: tap-smoke-test
+    config:
+      streams:
+      - stream_name: animals
+        input_filename: https://gitlab.com/meltano/tap-smoke-test/-/raw/main/demo-data/animals-data.jsonl
+      - stream_name: page_views
+        input_filename: https://gitlab.com/meltano/tap-smoke-test/-/raw/main/demo-data/pageviews-data.jsonl
+      stream_maps:
+        animals:
+          __key_properties__: [id]
+        page_views:
+          __key_properties__: [vistor_id]
+    schema:
+      animals:
+        views:
+          type: integer
+          x-sql-datatype: smallint
+  - name: tap-github
+    variant: meltanolabs
+    pip_url: git+https://github.com/MeltanoLabs/tap-github.git
+    config:
+      repositories:
+      - sbalnojan/meltano-lightdash
+      start_date: '2022-01-01'
+    select:
+    - commits.url
+    - commits.sha
+    - commits.commit_timestamp
+  loaders:
+  - name: target-postgres
+    namespace: target_postgres
+    pip_url: -e .
+    settings:
+    - name: sqlalchemy_url
+      kind: password
+      sensitive: true
+    - name: ssl_enable
+      kind: boolean
+      sensitive: true
+    - name: ssl_client_certificate_enable
+      kind: boolean
+      sensitive: true
+    - name: ssl_mode
+    - name: ssl_certificate_authority
+      kind: password
+      sensitive: true
+    - name: ssl_client_certificate
+      kind: password
+      sensitive: true
+    - name: ssl_client_private_key
+      kind: password
+      sensitive: true
+    - name: password
+      kind: password
+      sensitive: true
+    - name: host
+    - name: port
+      kind: integer
+    - name: user
+    - name: database
+    - name: use_copy
+      kind: boolean
+    - name: target_schema
+    - name: add_record_metadata
+      kind: boolean
+    config:
+      host: localhost
+      port: 5432
+      user: postgres
+      password: postgres
+      database: postgres
+      target_schema: test
+      add_record_metadata: true
+environments:
+- name: dev

@@ -1,0 +1,59 @@
+---
+# docker compose -d
+services:
+  postgres:
+    image: postgres:${POSTGRES_VERSION:-latest}
+    command: postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/server.crt -c ssl_key_file=/var/lib/postgresql/server.key -c ssl_ca_file=/var/lib/postgresql/ca.crt -c hba_file=/var/lib/postgresql/pg_hba.conf
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_HOST_AUTH_METHOD: cert clientcert=verify-full
+      POSTGRES_INITDB_ARGS: --auth-host=cert
+    # Not placed in the data directory (/var/lib/postgresql/data) because of https://gist.github.com/mrw34/c97bb03ea1054afb551886ffc8b63c3b?permalink_comment_id=2678568#gistcomment-2678568
+    volumes:
+      - ./ssl/server.crt:/var/lib/postgresql/server.crt # Certificate verifying the server's identity to the client.
+      - ./ssl/server.key:/var/lib/postgresql/server.key # Private key to verify the server's certificate is legitimate.
+      - ./ssl/ca.crt:/var/lib/postgresql/ca.crt # Certificate authority to use when verifying the client's identity to the server.
+      - ./ssl/pg_hba.conf:/var/lib/postgresql/pg_hba.conf # Configuration file to allow connection over SSL.
+    ports:
+      - "5432:5432"
+  postgres_no_ssl: # Borrowed from https://github.com/MeltanoLabs/tap-postgres/blob/main/.github/workflows/test.yml#L13-L23
+    image: postgres:${POSTGRES_VERSION:-latest}
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - 5433:5432
+  ssh:
+    image: ghcr.io/linuxserver/openssh-server:9.1_p1-r2-ls106 # This docker repo has added breaking changes a lot in the last month, pinning this.
+    container_name: openssh-server
+    hostname: openssh-server
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - PUBLIC_KEY_FILE=/config/ssh_host_keys/ssh_host_rsa_key.pub
+      - SUDO_ACCESS=false
+      - PASSWORD_ACCESS=false
+      - USER_NAME=melty
+    volumes:
+      - ./ssh_tunnel/ssh-server-config:/config/ssh_host_keys:ro
+    ports:
+      - "127.0.0.1:2223:2222"
+    networks:
+      - inner
+  postgresdb:
+    image: postgres:${POSTGRES_VERSION:-latest}
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: main
+    networks:
+      inner:
+        ipv4_address: 10.5.0.5
+networks:
+  inner:
+    driver: bridge
+    ipam:
+     config:
+       - subnet: 10.5.0.0/16
+         gateway: 10.5.0.1
