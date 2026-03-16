@@ -31,6 +31,7 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("ETL server shutting down — draining pipelines")
     await drain_running_pipelines(timeout=300)
+    await sync.drain_sync_tasks(timeout=300)
     logger.info("ETL server shutdown complete")
 
 

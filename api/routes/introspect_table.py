@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import inspect
 
 from core.connection_utils import create_sqlalchemy_engine
+from core.security import validate_etl_token
 
 logger = logging.getLogger("etl.introspect")
 router = APIRouter()
@@ -21,7 +22,7 @@ class IntrospectRequest(BaseModel):
     table_name: str
 
 
-@router.post("/introspect-table")
+@router.post("/introspect-table", dependencies=[Depends(validate_etl_token)])
 async def introspect_table(body: IntrospectRequest):
     host = body.connection_config.get("host") or body.connection_config.get(
         "hostname", "?"

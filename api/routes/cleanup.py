@@ -8,17 +8,20 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+import psycopg2
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-import psycopg2
-
+from core.config import settings
 from core.connector_support import normalize_source_type
+from core.encryption import decrypt_credentials
 from core.postgres_admin import drop_replication_slot
+from core.security import validate_etl_token
 from core.source_mutation_policy import are_source_db_mutations_allowed
 
 logger = logging.getLogger("etl.cleanup")
 router = APIRouter()
+
 
 def _require_supported_cleanup_source(source_type: str | None) -> str:
     normalized = normalize_source_type(source_type)
@@ -34,13 +37,13 @@ class CleanupConnectionRequest(BaseModel):
     source_type: str | None = None
     connection_config: dict | None = None
     replication_slot_name: str | None = None
+    slot_name: str | None = None
+    pg_conn_str_encrypted: str | None = None
 
 
-@router.post("/cleanup/connection")
+@router.post("/cleanup/connection", dependencies=[Depends(validate_etl_token)])
 async def cleanup_connection(body: CleanupConnectionRequest):
-    config = body.connection_config or {}
-    slot_name = body.replication_slot_name
-
+    slot_name = body.slot_name or body.replication_slot_name
     if not slot_name or not slot_name.strip():
         return {"ok": True, "message": "No replication slot to drop"}
     if not are_source_db_mutations_allowed():
@@ -48,6 +51,18 @@ async def cleanup_connection(body: CleanupConnectionRequest):
             "ok": True,
             "message": "Skipped replication slot cleanup because source DB mutations are disabled by policy",
         }
+
+    config = body.connection_config or {}
+    if body.pg_conn_str_encrypted and settings.ENCRYPTION_KEY:
+        try:
+            decrypted = decrypt_credentials(body.pg_conn_str_encrypted, settings.ENCRYPTION_KEY)
+            if isinstance(decrypted, dict):
+                config = decrypted
+            else:
+                config = {"connection_url": str(decrypted)}
+        except Exception as exc:
+            logger.warning("Failed to decrypt connection string: %s", exc)
+            raise HTTPException(status_code=400, detail="Invalid encrypted connection string")
 
     _require_supported_cleanup_source(body.source_type)
     try:

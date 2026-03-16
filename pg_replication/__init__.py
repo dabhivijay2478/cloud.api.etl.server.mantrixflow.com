@@ -5,6 +5,7 @@ from typing import Dict, Sequence, Optional, Iterable, Union
 import dlt
 
 from dlt.common import logger
+from .helpers import init_replication
 from dlt.common.typing import TDataItem
 from dlt.common.schema.typing import TTableSchemaColumns
 from dlt.extract.items import DataItemWithMeta

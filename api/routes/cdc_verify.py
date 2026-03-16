@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from core.connector_support import normalize_source_type
+from core.security import validate_etl_token
 from core.postgres_admin import (
     verify_pgoutput,
     verify_replication_role,
@@ -35,7 +36,7 @@ class CdcVerifyRequest(BaseModel):
     step: str | None = None
 
 
-@router.post("/cdc/verify")
+@router.post("/cdc/verify", dependencies=[Depends(validate_etl_token)])
 async def cdc_verify(body: CdcVerifyRequest):
     config = body.connection_config or {}
     if not config:
@@ -68,7 +69,7 @@ class CdcVerifyAllRequest(BaseModel):
     connection_config: dict | None = None
 
 
-@router.post("/cdc/verify-all")
+@router.post("/cdc/verify-all", dependencies=[Depends(validate_etl_token)])
 async def cdc_verify_all(body: CdcVerifyAllRequest):
     config = body.connection_config or {}
     if not config:

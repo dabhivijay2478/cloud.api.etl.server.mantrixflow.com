@@ -1,4 +1,4 @@
-"""Sync — POST /sync."""
+"""Sync — POST /sync. Accepts RunConfig or legacy SyncRequest, returns 202, posts callback when done."""
 
 from __future__ import annotations
 
@@ -6,171 +6,177 @@ import asyncio
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+import httpx
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from core.concurrency import run_semaphore, source_limiter
-from core.connector_support import normalize_dest_type, normalize_source_type
-from core.dlt_runner import run_sync, register_task, is_shutting_down
-from core.source_mutation_policy import (
-    SOURCE_DB_MUTATION_POLICY_MESSAGE,
-    are_source_db_mutations_allowed,
-)
+from core.config import settings
+from core.security import validate_etl_token
+from models.run_config import RunConfig
+from runner.dlt_runner import run, active_runs
 
 logger = logging.getLogger("etl.sync")
 router = APIRouter()
 
-DEFAULT_PORTS = {
-    "postgres": 5432,
-    "mysql": 3306,
-    "mariadb": 3306,
-    "mssql": 1433,
-    "oracle": 1521,
-    "cockroachdb": 26257,
-    "sqlite": 0,
-}
 
+class LegacySyncRequest(BaseModel):
+    """Legacy format from NestJS — converted to RunConfig."""
 
-class SyncRequest(BaseModel):
-    job_id: str
+    job_id: str | None = None
+    run_id: str | None = None
     pipeline_id: str
     organization_id: str
-    source_connection_config: dict[str, Any]
-    dest_connection_config: dict[str, Any]
+    org_id: str | None = None
+    source_connection_config: dict = {}
+    dest_connection_config: dict = {}
     source_type: str | None = None
     dest_type: str | None = None
-    replication_method: str  # FULL_TABLE, LOG_BASED, or INCREMENTAL
-    source_stream: str
-    dest_table: str
+    replication_method: str = "FULL_TABLE"
+    source_stream: str | None = None
+    selected_streams: list[str] | None = None
+    dest_table: str | None = None
     dest_schema: str = "public"
     replication_slot_name: str | None = None
-    replication_key: str | None = None  # Required when replication_method is INCREMENTAL
-    column_map: dict[str, str] | None = None
-    drop_columns: list[str] | None = None
+    replication_key: str | None = None
     transform_script: str | None = None
-    output_column_sql_types: dict[str, str] | None = None
-    transform_type: str | None = None
     emit_method: str = "append"
-    upsert_key: list[str] | None = None
-    hard_delete: bool = False
-    nestjs_callback_url: str
-    nestjs_state_url: str
-    discovered_catalog: dict[str, Any] | None = None
+    nestjs_callback_url: str | None = None
+    nestjs_state_url: str | None = None
     on_transform_error: str = "fail"
     dlt_backend: str = "sqlalchemy"
 
 
-@router.post("/sync")
-async def sync(body: SyncRequest):
+def _legacy_to_run_config(raw: dict) -> RunConfig:
+    """Convert legacy sync payload to RunConfig."""
+    run_id = raw.get("run_id") or raw.get("job_id", "")
+    org_id = raw.get("org_id") or raw.get("organization_id", "")
+    source = raw.get("source_connection_config", {})
+    dest = raw.get("dest_connection_config", {})
+    source_stream = raw.get("source_stream")
+    selected = raw.get("selected_streams")
+    if selected:
+        streams = selected
+    elif source_stream:
+        streams = [source_stream.split("-")[-1] if "-" in source_stream else source_stream]
+    else:
+        streams = []
+    stream_configs = dict(raw.get("stream_configs", {}))
+    dest_table = raw.get("dest_table")
+    if dest_table and streams:
+        stream_configs[streams[0]] = {**stream_configs.get(streams[0], {}), "dest_table": dest_table}
+
+    return RunConfig(
+        run_id=run_id,
+        pipeline_id=raw.get("pipeline_id", ""),
+        org_id=org_id,
+        connector_type=raw.get("source_type", "postgres"),
+        replication_method=(raw.get("replication_method") or "FULL_TABLE").upper(),
+        source_host=source.get("host", "localhost"),
+        source_port=int(source.get("port", 5432)),
+        source_user=source.get("username", source.get("user", "")),
+        source_password=source.get("password", ""),
+        source_database=source.get("database", source.get("dbname", "")),
+        source_schema=source.get("schema", "public"),
+        source_ssl_mode=str(source.get("ssl_mode", source.get("sslmode", "require"))),
+        dest_host=dest.get("host", "localhost"),
+        dest_port=int(dest.get("port", 5432)),
+        dest_user=dest.get("username", dest.get("user", "")),
+        dest_password=dest.get("password", ""),
+        dest_database=dest.get("database", dest.get("dbname", "")),
+        dest_schema=raw.get("dest_schema", "public"),
+        dest_ssl_mode=str(dest.get("ssl_mode", dest.get("sslmode", "require"))),
+        selected_streams=streams,
+        stream_configs=stream_configs,
+        replication_key=raw.get("replication_key"),
+        last_state=raw.get("last_state"),
+        replication_slot_name=raw.get("replication_slot_name"),
+        replication_pub_name=raw.get("replication_pub_name"),
+        emit_method="merge" if raw.get("emit_method") in ("merge", "upsert") else raw.get("emit_method", "append"),
+        transform_script=raw.get("transform_script"),
+        on_transform_error=raw.get("on_transform_error", "fail"),
+        dlt_backend=raw.get("dlt_backend", "sqlalchemy"),
+        callback_url=raw.get("nestjs_callback_url"),
+    )
+
+_sync_tasks: set = set()
+
+
+async def drain_sync_tasks(timeout: float = 300) -> None:
+    """Wait for in-flight sync tasks to complete on shutdown."""
+    if not _sync_tasks:
+        return
+    done, pending = await asyncio.wait(_sync_tasks, timeout=timeout)
+    if pending:
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def _run_and_callback(config: RunConfig) -> None:
+    """Execute run and post callback to NestJS."""
     try:
-        source_type = normalize_source_type(body.source_type)
-        dest_type = normalize_dest_type(body.dest_type)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        payload = await run(config)
+        callback_url = config.callback_url or settings.CALLBACK_URL
+        if not callback_url:
+            logger.error("CALLBACK_URL not set — cannot post callback for run %s", config.run_id)
+            return
+        async with httpx.AsyncClient(timeout=30) as client:
+            token = settings.CALLBACK_TOKEN or settings.ETL_INTERNAL_TOKEN
+            headers = {"Content-Type": "application/json"}
+            if token:
+                headers["X-Callback-Token"] = token
+                headers["x-internal-token"] = token
+            resp = await client.post(
+                callback_url,
+                json=payload.model_dump(mode="json"),
+                headers=headers,
+            )
+            if resp.status_code >= 400:
+                logger.error(
+                    "Callback failed for run %s: HTTP %d %s",
+                    config.run_id,
+                    resp.status_code,
+                    resp.text[:500],
+                )
+    except Exception:
+        logger.exception("Run failed for %s", config.run_id)
+    finally:
+        active_runs.discard(config.run_id)
 
-    replication_method_upper = body.replication_method.upper()
-    if replication_method_upper not in ("FULL_TABLE", "LOG_BASED", "INCREMENTAL"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid replication_method: {body.replication_method}. Must be FULL_TABLE, LOG_BASED, or INCREMENTAL.",
-        )
 
-    if replication_method_upper == "INCREMENTAL" and not body.replication_key:
-        raise HTTPException(
-            status_code=400,
-            detail="replication_key is required when replication_method is INCREMENTAL.",
-        )
-    if replication_method_upper == "LOG_BASED" and not are_source_db_mutations_allowed():
-        raise HTTPException(status_code=400, detail=SOURCE_DB_MUTATION_POLICY_MESSAGE)
-
-    if is_shutting_down():
+@router.post("/sync", dependencies=[Depends(validate_etl_token)])
+async def sync(body: dict):
+    if len(active_runs) >= settings.MAX_CONCURRENT_RUNS:
         return JSONResponse(
-            status_code=503,
-            content={"error": "Pod is shutting down, not accepting new syncs"},
-        )
-
-    # Check global concurrency
-    acquired = await run_semaphore.acquire()
-    if not acquired:
-        return JSONResponse(
-            status_code=503,
+            status_code=429,
             content={
                 "error": "Pod at capacity",
-                "active_runs": run_semaphore.active,
-                "max_runs": run_semaphore.max_runs,
+                "active_runs": len(active_runs),
+                "max_runs": settings.MAX_CONCURRENT_RUNS,
             },
         )
 
-    # Check per-source rate limit
-    source_host = (
-        body.source_connection_config.get("host")
-        or body.source_connection_config.get("database")
-        or body.source_connection_config.get("path")
-        or "unknown"
-    )
-    source_port = int(
-        body.source_connection_config.get("port")
-        or DEFAULT_PORTS.get(source_type, 5432)
-    )
-    source_acquired = await source_limiter.acquire(source_host, source_port)
-    if not source_acquired:
-        await run_semaphore.release()
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": f"Source {source_host}:{source_port} at tap limit",
-            },
-        )
+    if "run_id" in body and "selected_streams" in body:
+        config = RunConfig.model_validate(body)
+    else:
+        config = _legacy_to_run_config(body)
+    run_id = config.run_id
+
+    active_runs.add(run_id)
+    task = asyncio.create_task(_run_and_callback(config))
+    _sync_tasks.add(task)
+    task.add_done_callback(_sync_tasks.discard)
 
     logger.info(
-        "Sync accepted: job=%s pipeline=%s stream=%s method=%s dest=%s.%s",
-        body.job_id, body.pipeline_id, body.source_stream,
-        body.replication_method, body.dest_schema, body.dest_table,
+        "Sync accepted: run_id=%s pipeline=%s streams=%s method=%s",
+        run_id,
+        config.pipeline_id,
+        len(config.selected_streams),
+        config.replication_method,
     )
 
-    task = asyncio.create_task(
-        _run_and_release(body, source_host, source_port, source_type, dest_type)
+    return JSONResponse(
+        status_code=202,
+        content={"run_id": run_id, "job_id": run_id, "status": "accepted"},
     )
-    register_task(task)
-
-    return {"job_id": body.job_id, "status": "accepted"}
-
-
-async def _run_and_release(
-    body: SyncRequest, source_host: str, source_port: int,
-    source_type: str = "postgres", dest_type: str = "postgres",
-) -> None:
-    """Run the sync then release semaphore and source limiter."""
-    try:
-        await run_sync(
-            job_id=body.job_id,
-            pipeline_id=body.pipeline_id,
-            organization_id=body.organization_id,
-            source_connection_config=body.source_connection_config,
-            dest_connection_config=body.dest_connection_config,
-            source_type=source_type,
-            dest_type=dest_type,
-            replication_method=body.replication_method.upper(),
-            source_stream=body.source_stream,
-            dest_table=body.dest_table,
-            dest_schema=body.dest_schema,
-            replication_slot_name=body.replication_slot_name,
-            replication_key=body.replication_key,
-            column_map=body.column_map,
-            drop_columns=body.drop_columns,
-            transform_script=body.transform_script,
-            output_column_sql_types=body.output_column_sql_types,
-            emit_method=body.emit_method,
-            upsert_key=body.upsert_key,
-            hard_delete=body.hard_delete,
-            nestjs_callback_url=body.nestjs_callback_url,
-            nestjs_state_url=body.nestjs_state_url,
-            on_transform_error=body.on_transform_error,
-            dlt_backend=body.dlt_backend,
-        )
-    except Exception:
-        logger.exception("Sync task failed for job %s", body.job_id)
-    finally:
-        await source_limiter.release(source_host, source_port)
-        await run_semaphore.release()
