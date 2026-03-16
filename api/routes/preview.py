@@ -1,16 +1,12 @@
-"""Preview — POST /preview.
-
-Runs tap in FULL_TABLE mode through transformer, collects N records.
-No target, no destination write.
-"""
+"""Preview — POST /preview."""
 
 import logging
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from core.config_builder import resolve_tap_type
-from core.singer_runner import run_preview
+from core.connector_support import normalize_source_type
+from core.dlt_runner import run_preview
 
 logger = logging.getLogger("etl.preview")
 router = APIRouter()
@@ -18,18 +14,18 @@ router = APIRouter()
 
 class PreviewRequest(BaseModel):
     connection_config: dict | None = None
-    source_config: dict | None = None
     source_stream: str
     limit: int = 50
     column_map: dict[str, str] | None = None
     drop_columns: list[str] | None = None
     transform_script: str | None = None
     source_type: str | None = None
+    on_transform_error: str = "fail"
 
 
 @router.post("/preview")
 async def preview(body: PreviewRequest):
-    config = body.connection_config or body.source_config or {}
+    config = body.connection_config or {}
     if not config:
         raise HTTPException(status_code=400, detail="connection_config is required")
     if not body.source_stream:
@@ -41,8 +37,8 @@ async def preview(body: PreviewRequest):
     )
 
     try:
-        source_type = resolve_tap_type(body.source_type)
-    except ValueError as exc:
+        source_type = normalize_source_type(body.source_type)
+    except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
@@ -54,6 +50,7 @@ async def preview(body: PreviewRequest):
             drop_columns=body.drop_columns,
             transform_script=body.transform_script,
             source_type=source_type,
+            on_transform_error=body.on_transform_error,
         )
     except RuntimeError as exc:
         logger.error("Preview failed for stream %s: %s", body.source_stream, exc)

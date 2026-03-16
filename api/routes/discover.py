@@ -1,26 +1,15 @@
-"""Schema discovery — POST /discover.
+"""Schema discovery — POST /discover."""
 
-Spawns tap-postgres --discover, parses the catalog into a stream list
-with column info, primary keys, and LOG_BASED eligibility.
-
-Retries once on transient connection/DNS errors (e.g. brief network blip).
-"""
-
-import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from core.config_builder import resolve_tap_type
-from core.singer_runner import run_discover
-from core.catalog_builder import parse_discovered_streams
+from core.connection_utils import discover_sql_schema
+from core.connector_support import normalize_source_type
 
 logger = logging.getLogger("etl.discover")
 router = APIRouter()
-
-DISCOVER_RETRY_DELAY_SEC = 2
-
 
 def _user_friendly_connection_error(exc: BaseException) -> str | None:
     """Return a user-friendly message for common connection/DNS errors, or None."""
@@ -54,8 +43,8 @@ async def discover(body: DiscoverRequest):
         raise HTTPException(status_code=400, detail="connection_config is required")
 
     try:
-        source_type = resolve_tap_type(body.source_type)
-    except ValueError as exc:
+        source_type = normalize_source_type(body.source_type)
+    except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     host = body.connection_config.get("host", "?")
@@ -65,39 +54,22 @@ async def discover(body: DiscoverRequest):
         host, dbname, body.schema_name or "all", source_type,
     )
 
-    raw_catalog = None
-    last_exc: RuntimeError | None = None
-    for attempt in range(2):
-        try:
-            raw_catalog = await run_discover(body.connection_config, source_type=source_type)
-            break
-        except RuntimeError as exc:
-            last_exc = exc
-            if attempt == 0 and _user_friendly_connection_error(exc):
-                logger.warning(
-                    "Discovery attempt %d failed for %s/%s, retrying in %ds: %s",
-                    attempt + 1, host, dbname, DISCOVER_RETRY_DELAY_SEC, exc,
-                )
-                await asyncio.sleep(DISCOVER_RETRY_DELAY_SEC)
-            else:
-                break
+    try:
+        result = discover_sql_schema(
+            source_type,
+            body.connection_config,
+            schema_name=body.schema_name,
+        )
+    except Exception as exc:
+        logger.error("Discovery failed for %s/%s: %s", host, dbname, exc)
+        detail = _user_friendly_connection_error(exc) or str(exc)
+        raise HTTPException(status_code=500, detail=detail) from exc
 
-    if raw_catalog is None and last_exc:
-        logger.error("Discovery failed for %s/%s: %s", host, dbname, last_exc)
-        detail = _user_friendly_connection_error(last_exc) or str(last_exc)
-        raise HTTPException(status_code=500, detail=detail)
-
-    streams = parse_discovered_streams(raw_catalog)
-
-    if body.schema_name:
-        streams = [
-            s for s in streams
-            if body.schema_name in s["stream_name"] or body.schema_name in s["tap_stream_id"]
-        ]
+    streams = result.get("streams", [])
 
     logger.info(
         "Discovered %d stream(s) for %s/%s",
         len(streams), host, dbname,
     )
 
-    return {"streams": streams, "raw_catalog": raw_catalog}
+    return result

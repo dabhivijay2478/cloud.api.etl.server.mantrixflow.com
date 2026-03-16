@@ -1,4 +1,4 @@
-"""MANTrixFlow ETL Server — Singer-based tap-postgres -> transformer -> target-postgres."""
+"""MANTrixFlow ETL Server — dlt-based extraction, load, and transform service."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes import health, test_connection, discover, preview, sync, introspect_table, cdc_verify, cleanup
-from core.singer_runner import cleanup_stale_tmpfs, drain_running_pipelines
+from core.dlt_runner import cleanup_stale_tmpfs, drain_running_pipelines
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="MANTrixFlow ETL Server",
-    description="Singer-based ETL: tap-postgres -> transformer -> target-postgres",
+    description="dlt-based ETL service for SQL and MongoDB pipelines",
     version="2.0.0",
     lifespan=lifespan,
 )

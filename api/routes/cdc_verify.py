@@ -1,7 +1,4 @@
-"""CDC verification — POST /cdc/verify, POST /cdc/verify-all.
-
-Connector-type-specific. For postgres: wal_level, wal2json, replication_role, replication_test.
-"""
+"""CDC verification — POST /cdc/verify, POST /cdc/verify-all."""
 
 from __future__ import annotations
 
@@ -10,9 +7,9 @@ from pydantic import BaseModel
 
 from core.connector_support import normalize_source_type
 from core.postgres_admin import (
+    verify_pgoutput,
     verify_replication_role,
     verify_replication_test,
-    verify_wal2json,
     verify_wal_level,
 )
 from core.source_mutation_policy import (
@@ -51,14 +48,15 @@ async def cdc_verify(body: CdcVerifyRequest):
 
     handlers = {
         "wal_level": verify_wal_level,
-        "wal2json": verify_wal2json,
+        "pgoutput": verify_pgoutput,
         "replication_role": verify_replication_role,
         "replication_test": verify_replication_test,
     }
     if step not in handlers:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown step: {step}. Valid: wal_level, wal2json, replication_role, replication_test",
+            detail="Unknown step: %s. Valid: wal_level, pgoutput, replication_role, replication_test"
+            % step,
         )
 
     result = handlers[step](config)
@@ -82,7 +80,7 @@ async def cdc_verify_all(body: CdcVerifyAllRequest):
             "ok": False,
             "steps": {
                 "wal_level": verify_wal_level(config),
-                "wal2json": verify_wal2json(config),
+                "pgoutput": verify_pgoutput(config),
                 "replication_role": verify_replication_role(config),
                 "replication_test": {
                     "ok": False,
@@ -92,10 +90,10 @@ async def cdc_verify_all(body: CdcVerifyAllRequest):
             "overall": "failed",
         }
 
-    steps_order = ["wal_level", "wal2json", "replication_role", "replication_test"]
+    steps_order = ["wal_level", "pgoutput", "replication_role", "replication_test"]
     handlers = {
         "wal_level": verify_wal_level,
-        "wal2json": verify_wal2json,
+        "pgoutput": verify_pgoutput,
         "replication_role": verify_replication_role,
         "replication_test": verify_replication_test,
     }

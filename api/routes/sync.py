@@ -1,11 +1,4 @@
-"""Sync — POST /sync.
-
-Accepts a pipeline sync request, validates capacity, returns immediately
-with {job_id, status: "accepted"}, and runs the Singer chain in the background.
-
-Returns 503 if the pod is at capacity or the source DB is at its tap limit.
-Returns 400 if replication_method is INCREMENTAL.
-"""
+"""Sync — POST /sync."""
 
 from __future__ import annotations
 
@@ -18,8 +11,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from core.concurrency import run_semaphore, source_limiter
-from core.config_builder import resolve_target_type, resolve_tap_type
-from core.singer_runner import run_sync, register_task, is_shutting_down
+from core.connector_support import normalize_dest_type, normalize_source_type
+from core.dlt_runner import run_sync, register_task, is_shutting_down
 from core.source_mutation_policy import (
     SOURCE_DB_MUTATION_POLICY_MESSAGE,
     are_source_db_mutations_allowed,
@@ -27,6 +20,16 @@ from core.source_mutation_policy import (
 
 logger = logging.getLogger("etl.sync")
 router = APIRouter()
+
+DEFAULT_PORTS = {
+    "postgres": 5432,
+    "mysql": 3306,
+    "mariadb": 3306,
+    "mssql": 1433,
+    "oracle": 1521,
+    "cockroachdb": 26257,
+    "sqlite": 0,
+}
 
 
 class SyncRequest(BaseModel):
@@ -37,11 +40,12 @@ class SyncRequest(BaseModel):
     dest_connection_config: dict[str, Any]
     source_type: str | None = None
     dest_type: str | None = None
-    replication_method: str  # FULL_TABLE or LOG_BASED
+    replication_method: str  # FULL_TABLE, LOG_BASED, or INCREMENTAL
     source_stream: str
     dest_table: str
     dest_schema: str = "public"
     replication_slot_name: str | None = None
+    replication_key: str | None = None  # Required when replication_method is INCREMENTAL
     column_map: dict[str, str] | None = None
     drop_columns: list[str] | None = None
     transform_script: str | None = None
@@ -53,28 +57,31 @@ class SyncRequest(BaseModel):
     nestjs_callback_url: str
     nestjs_state_url: str
     discovered_catalog: dict[str, Any] | None = None
+    on_transform_error: str = "fail"
+    dlt_backend: str = "sqlalchemy"
 
 
 @router.post("/sync")
 async def sync(body: SyncRequest):
     try:
-        source_type = resolve_tap_type(body.source_type)
-        dest_type = resolve_target_type(body.dest_type)
-    except ValueError as exc:
+        source_type = normalize_source_type(body.source_type)
+        dest_type = normalize_dest_type(body.dest_type)
+    except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if body.replication_method.upper() == "INCREMENTAL":
+    replication_method_upper = body.replication_method.upper()
+    if replication_method_upper not in ("FULL_TABLE", "LOG_BASED", "INCREMENTAL"):
         raise HTTPException(
             status_code=400,
-            detail="INCREMENTAL replication is not supported. Use FULL_TABLE or LOG_BASED.",
+            detail=f"Invalid replication_method: {body.replication_method}. Must be FULL_TABLE, LOG_BASED, or INCREMENTAL.",
         )
 
-    if body.replication_method.upper() not in ("FULL_TABLE", "LOG_BASED"):
+    if replication_method_upper == "INCREMENTAL" and not body.replication_key:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid replication_method: {body.replication_method}. Must be FULL_TABLE or LOG_BASED.",
+            detail="replication_key is required when replication_method is INCREMENTAL.",
         )
-    if body.replication_method.upper() == "LOG_BASED" and not are_source_db_mutations_allowed():
+    if replication_method_upper == "LOG_BASED" and not are_source_db_mutations_allowed():
         raise HTTPException(status_code=400, detail=SOURCE_DB_MUTATION_POLICY_MESSAGE)
 
     if is_shutting_down():
@@ -96,8 +103,16 @@ async def sync(body: SyncRequest):
         )
 
     # Check per-source rate limit
-    source_host = body.source_connection_config.get("host", "unknown")
-    source_port = int(body.source_connection_config.get("port", 5432))
+    source_host = (
+        body.source_connection_config.get("host")
+        or body.source_connection_config.get("database")
+        or body.source_connection_config.get("path")
+        or "unknown"
+    )
+    source_port = int(
+        body.source_connection_config.get("port")
+        or DEFAULT_PORTS.get(source_type, 5432)
+    )
     source_acquired = await source_limiter.acquire(source_host, source_port)
     if not source_acquired:
         await run_semaphore.release()
@@ -141,6 +156,7 @@ async def _run_and_release(
             dest_table=body.dest_table,
             dest_schema=body.dest_schema,
             replication_slot_name=body.replication_slot_name,
+            replication_key=body.replication_key,
             column_map=body.column_map,
             drop_columns=body.drop_columns,
             transform_script=body.transform_script,
@@ -150,7 +166,8 @@ async def _run_and_release(
             hard_delete=body.hard_delete,
             nestjs_callback_url=body.nestjs_callback_url,
             nestjs_state_url=body.nestjs_state_url,
-            discovered_catalog=body.discovered_catalog,
+            on_transform_error=body.on_transform_error,
+            dlt_backend=body.dlt_backend,
         )
     except Exception:
         logger.exception("Sync task failed for job %s", body.job_id)

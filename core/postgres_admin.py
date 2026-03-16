@@ -7,33 +7,19 @@ import logging
 import psycopg2
 import psycopg2.extras
 
-from core.config_builder import _extract_common
+from core.connection_utils import build_sqlalchemy_url
 
 logger = logging.getLogger("etl.postgres_admin")
 
 
-def build_postgres_conn_params(conn: dict) -> dict:
-    """Build psycopg2 connection params from stored connector config.
-
-    Uses _extract_common so SSL, timeout, and all field aliases are resolved
-    identically to every other connection in the system.
-    """
-    cfg = _extract_common(conn)
-    return {
-        "host": cfg["host"],
-        "port": cfg["port"],
-        "user": cfg["user"],
-        "password": cfg["password"],
-        "dbname": cfg["database"],
-        "sslmode": cfg["ssl_mode"],
-        "connect_timeout": cfg["connect_timeout"],
-    }
+def build_postgres_dsn(conn: dict) -> str:
+    return build_sqlalchemy_url("postgres", conn).replace("postgresql+psycopg2://", "postgresql://", 1)
 
 
 def verify_wal_level(conn: dict) -> dict:
-    params = build_postgres_conn_params(conn)
+    params = build_postgres_dsn(conn)
     try:
-        with psycopg2.connect(**params) as pg:
+        with psycopg2.connect(params) as pg:
             with pg.cursor() as cur:
                 cur.execute("SHOW wal_level")
                 row = cur.fetchone()
@@ -47,29 +33,31 @@ def verify_wal_level(conn: dict) -> dict:
         return {"ok": False, "wal_level": "error", "error": str(exc)}
 
 
-def verify_wal2json(conn: dict) -> dict:
-    params = build_postgres_conn_params(conn)
+def verify_pgoutput(conn: dict) -> dict:
+    params = build_postgres_dsn(conn)
     try:
-        with psycopg2.connect(**params) as pg:
+        with psycopg2.connect(params) as pg:
             with pg.cursor() as cur:
-                cur.execute(
-                    "SELECT name, installed_version"
-                    " FROM pg_available_extensions WHERE name = 'wal2json'"
-                )
+                cur.execute("SHOW server_version_num")
                 row = cur.fetchone()
-                if row and row[1]:
-                    return {"ok": True, "installed_version": row[1]}
-                return {"ok": False, "installed_version": None}
+                version = int(row[0]) if row and row[0] else 0
+                return {
+                    "ok": version >= 100000,
+                    "plugin": "pgoutput",
+                    "server_version_num": version,
+                }
     except Exception as exc:
-        logger.warning("wal2json check failed: %s", exc)
+        logger.warning("pgoutput check failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 
 def verify_replication_role(conn: dict) -> dict:
-    params = build_postgres_conn_params(conn)
-    params["connection_factory"] = psycopg2.extras.LogicalReplicationConnection
+    params = build_postgres_dsn(conn)
     try:
-        with psycopg2.connect(**params):
+        with psycopg2.connect(
+            params,
+            connection_factory=psycopg2.extras.LogicalReplicationConnection,
+        ):
             return {"ok": True}
     except Exception as exc:
         logger.warning("replication role check failed: %s", exc)
@@ -77,13 +65,13 @@ def verify_replication_role(conn: dict) -> dict:
 
 
 def verify_replication_test(conn: dict) -> dict:
-    params = build_postgres_conn_params(conn)
+    params = build_postgres_dsn(conn)
     slot_name = "mxf_cdc_test_temp"
     try:
-        with psycopg2.connect(**params) as pg:
+        with psycopg2.connect(params) as pg:
             with pg.cursor() as cur:
                 cur.execute(
-                    "SELECT * FROM pg_create_logical_replication_slot(%s, 'wal2json')",
+                    "SELECT * FROM pg_create_logical_replication_slot(%s, 'pgoutput')",
                     (slot_name,),
                 )
             with pg.cursor() as cur:
@@ -92,7 +80,7 @@ def verify_replication_test(conn: dict) -> dict:
     except Exception as exc:
         # Best-effort cleanup of the slot we may have just created
         try:
-            with psycopg2.connect(**params) as pg:
+            with psycopg2.connect(params) as pg:
                 with pg.cursor() as cur:
                     cur.execute("SELECT pg_drop_replication_slot(%s)", (slot_name,))
         except Exception:
@@ -102,9 +90,9 @@ def verify_replication_test(conn: dict) -> dict:
 
 
 def drop_replication_slot(conn: dict, slot_name: str) -> dict:
-    params = build_postgres_conn_params(conn)
+    params = build_postgres_dsn(conn)
     try:
-        with psycopg2.connect(**params) as pg:
+        with psycopg2.connect(params) as pg:
             with pg.cursor() as cur:
                 cur.execute("SELECT pg_drop_replication_slot(%s)", (slot_name.strip(),))
         logger.info("Dropped replication slot: %s", slot_name)

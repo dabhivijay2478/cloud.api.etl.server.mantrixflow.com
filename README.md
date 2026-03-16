@@ -1,39 +1,25 @@
-# MANTrixFlow ETL Server — Singer Architecture
+# MANTrixFlow ETL Server — dlt Architecture
 
-Singer-based ETL microservice using `tap-postgres` and `target-postgres` subprocess CLIs.
-
-See [docs/etl-data-flow.md](../../docs/etl-data-flow.md) for the full Incoming Data → Transformation → Outgoing Data pipeline flow.
+Python FastAPI ETL service powered by `dlt`, SQLAlchemy reflection, and first-party copies of the dlt verified MongoDB and PostgreSQL replication sources.
 
 ## Architecture
 
-```
-tap-postgres --config --catalog [--state] | singer_transformer | target-postgres --config
+```text
+NestJS queue -> FastAPI /sync -> core/dlt_runner.py -> dlt source/resource -> dlt destination
 ```
 
-- **Zero Supabase at ETL level** — all DB access through NestJS API callbacks
-- **Zero dlt** — Singer subprocess CLIs only
-- **K8s native** — semaphore-controlled concurrency, 503 backpressure, graceful shutdown
+- One execution engine for syncs, previews, and transforms
+- No Singer subprocesses or vendor tap/target repos
+- SQL discovery via SQLAlchemy, Mongo discovery via sampled document inference
+- Async dispatch with callback/state handoff back to NestJS
 
 ## Setup
 
 ```bash
-# Clone Singer repos
-mkdir vendor
-git clone https://github.com/MeltanoLabs/tap-postgres.git vendor/tap-postgres
-git clone https://github.com/MeltanoLabs/target-postgres.git vendor/target-postgres
-
-# Create venv and install
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-pip install -e vendor/tap-postgres -e vendor/target-postgres
-
-# Copy .env (required for tap/target registry; loaded automatically at startup)
 cp .env.example .env
-
-# Verify CLIs
-tap-postgres --version
-target-postgres --version
 ```
 
 ## Run
@@ -43,68 +29,47 @@ source .venv/bin/activate
 uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 1 --loop asyncio
 ```
 
-> **Note:** Use `--loop asyncio` to avoid uvloop subprocess compatibility issues with Python 3.13 (e.g. `AttributeError: 'StreamReader' object has no attribute 'fileno'`). If using Python 3.12 or earlier with uvloop, you may omit `--loop asyncio`.
-
-## Docker
-
-```bash
-docker compose up --build
-```
-
 ## API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET/POST | `/health` | Pod capacity info (active_runs, max_runs, available) |
-| POST | `/test-connection` | Spawns `tap-postgres --test` |
-| POST | `/discover` | Spawns `tap-postgres --discover`, returns stream list |
-| POST | `/preview` | FULL_TABLE tap through transformer, returns N records |
-| POST | `/sync` | Async sync — returns `{job_id, status: "accepted"}` or 503 |
+| GET/POST | `/health` | Pod capacity info |
+| POST | `/test-connection` | SQLAlchemy ping or MongoDB ping |
+| POST | `/discover` | SQLAlchemy reflection or MongoDB schema sampling |
+| POST | `/preview` | Reads sample records through dlt resources, no destination write |
+| POST | `/sync` | Async dlt sync, returns `{job_id, status: "accepted"}` or 503 |
+| POST | `/cdc/verify` | PostgreSQL logical replication checks |
+| POST | `/cleanup/connection` | Drops PostgreSQL replication slot when needed |
 
-## Environment Variables
+## Environment
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TAP_POSTGRES` | (required) | Tap executable for Postgres. Set in .env (see .env.example). Loaded automatically at startup. |
-| `TARGET_POSTGRES` | (required) | Target executable for Postgres. Set in .env. Loaded automatically at startup. |
-| `SSL_CLOUD_HOST_SUFFIXES` | (optional) | Comma-separated host suffixes that auto-enable SSL. If unset, SSL only when connection has explicit `ssl` config. |
-| `MAX_CONCURRENT_RUNS` | 20 | Max Singer chains per pod (semaphore) |
-| `MAX_TAPS_PER_SOURCE` | 3 | Max concurrent taps per source host:port |
-
-## K8s Deployment
-
-```bash
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/hpa.yaml
-kubectl apply -f k8s/service.yaml
-```
-
-HPA scales from 3 pods (60 concurrent) to 30 pods (600 concurrent) based on CPU.
+| `MAX_CONCURRENT_RUNS` | 20 | Max concurrent sync tasks per pod |
+| `MAX_TAPS_PER_SOURCE` | 3 | Max concurrent syncs per source host:port |
 
 ## Project Structure
 
-```
+```text
 api/
-  main.py          — FastAPI app with lifespan (graceful shutdown)
+  main.py
   routes/
-    health.py      — GET/POST /health
+    health.py
     test_connection.py
     discover.py
     preview.py
-    sync.py        — POST /sync (async, 503 backpressure)
-config/
-  connections.py   — Postgres connection string builder
+    sync.py
 core/
-  singer_runner.py     — Subprocess lifecycle manager
-  singer_transformer.py — Singer message transformer (stdin/stdout)
-  catalog_builder.py   — Builds Singer catalog JSON
-  config_builder.py    — Builds tap/target config dicts
-  concurrency.py       — RunSemaphore + SourceRateLimiter
-vendor/
-  tap-postgres/    — Cloned MeltanoLabs/tap-postgres
-  target-postgres/ — Cloned MeltanoLabs/target-postgres
-k8s/
-  deployment.yaml  — K8s Deployment (terminationGracePeriod: 600s)
-  hpa.yaml         — HPA (3-30 pods, CPU 60%)
-  service.yaml     — ClusterIP Service
+  dlt_runner.py
+  connection_utils.py
+  transform_utils.py
+  concurrency.py
+mongodb/
+  __init__.py
+  helpers.py
+pg_replication/
+  __init__.py
+  helpers.py
+  decoders.py
+  schema_types.py
 ```

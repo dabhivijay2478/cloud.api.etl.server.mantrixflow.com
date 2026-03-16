@@ -1,43 +1,18 @@
-"""Introspect table — POST /introspect-table.
-
-Returns actual PostgreSQL column types, identity info, and constraints
-for an existing table. Uses psycopg directly (not Singer) so the caller
-gets real PG types instead of Singer JSON Schema types.
-
-Connection handling is fully delegated to core.config_builder.build_psycopg_dsn
-so SSL, pooler, URL-encoding, and timeout behaviour is identical across all routes.
-"""
+"""Introspect table — POST /introspect-table."""
 
 from __future__ import annotations
 
 import logging
 from typing import Any
 
-import psycopg
-from core.config_builder import build_psycopg_dsn
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import inspect
+
+from core.connection_utils import create_sqlalchemy_engine
 
 logger = logging.getLogger("etl.introspect")
 router = APIRouter()
-
-INTROSPECT_SQL = """\
-SELECT
-    c.column_name,
-    c.data_type,
-    c.udt_name,
-    c.is_nullable,
-    c.column_default,
-    c.is_identity,
-    c.identity_generation,
-    c.character_maximum_length,
-    c.numeric_precision,
-    c.numeric_scale
-FROM information_schema.columns c
-WHERE c.table_schema = %s
-  AND c.table_name   = %s
-ORDER BY c.ordinal_position
-"""
 
 
 class IntrospectRequest(BaseModel):
@@ -48,7 +23,6 @@ class IntrospectRequest(BaseModel):
 
 @router.post("/introspect-table")
 async def introspect_table(body: IntrospectRequest):
-    dsn = build_psycopg_dsn(body.connection_config)
     host = body.connection_config.get("host") or body.connection_config.get(
         "hostname", "?"
     )
@@ -61,10 +35,9 @@ async def introspect_table(body: IntrospectRequest):
     )
 
     try:
-        with psycopg.connect(dsn) as conn:
-            with conn.cursor() as cur:
-                cur.execute(INTROSPECT_SQL, (body.schema_name, body.table_name))
-                rows = cur.fetchall()
+        engine = create_sqlalchemy_engine("postgres", body.connection_config)
+        inspector = inspect(engine)
+        rows = inspector.get_columns(body.table_name, schema=body.schema_name)
     except Exception as exc:
         logger.error(
             "Introspect failed for %s.%s on %s: %s",
@@ -85,37 +58,23 @@ async def introspect_table(body: IntrospectRequest):
                 f"Table {body.schema_name}.{body.table_name} not found "
                 "or has no columns"
             ),
-        )
+    )
 
-    columns = []
-    for row in rows:
-        (
-            col_name,
-            data_type,
-            udt_name,
-            is_nullable,
-            col_default,
-            is_identity,
-            identity_generation,
-            char_max_len,
-            numeric_precision,
-            numeric_scale,
-        ) = row
-
-        columns.append(
-            {
-                "name": col_name,
-                "data_type": data_type,
-                "udt_name": udt_name,
-                "is_nullable": is_nullable == "YES",
-                "has_default": col_default is not None,
-                "is_identity": is_identity == "YES",
-                "identity_generation": identity_generation or None,
-                "character_maximum_length": char_max_len,
-                "numeric_precision": numeric_precision,
-                "numeric_scale": numeric_scale,
-            }
-        )
+    columns = [
+        {
+            "name": str(column["name"]),
+            "data_type": str(column.get("type")).lower(),
+            "udt_name": str(column.get("type")).lower(),
+            "is_nullable": bool(column.get("nullable", True)),
+            "has_default": column.get("default") is not None,
+            "is_identity": False,
+            "identity_generation": None,
+            "character_maximum_length": None,
+            "numeric_precision": None,
+            "numeric_scale": None,
+        }
+        for column in rows
+    ]
 
     logger.info(
         "Introspected %s.%s: %d column(s)",

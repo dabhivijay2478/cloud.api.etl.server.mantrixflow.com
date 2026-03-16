@@ -1,8 +1,4 @@
-"""Concurrency control for K8s-scaled ETL pods.
-
-- RunSemaphore: limits total concurrent Singer chains per pod.
-- SourceRateLimiter: limits concurrent taps per source host:port.
-"""
+"""Concurrency control for K8s-scaled ETL pods."""
 
 from __future__ import annotations
 
@@ -16,7 +12,7 @@ MAX_TAPS_PER_SOURCE = int(os.environ.get("MAX_TAPS_PER_SOURCE", "3"))
 
 
 class RunSemaphore:
-    """Global semaphore bounding the number of active Singer subprocess chains."""
+    """Global semaphore bounding the number of active ETL runs."""
 
     def __init__(self, max_runs: int = MAX_CONCURRENT_RUNS) -> None:
         self._max = max_runs
@@ -52,11 +48,7 @@ class RunSemaphore:
 
 
 class SourceRateLimiter:
-    """Per-source-host concurrency limiter.
-
-    Prevents overwhelming a single user's Postgres instance with too many
-    concurrent tap-postgres processes.
-    """
+    """Per-source-host concurrency limiter."""
 
     def __init__(self, max_per_source: int = MAX_TAPS_PER_SOURCE) -> None:
         self._max = max_per_source

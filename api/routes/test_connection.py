@@ -1,16 +1,12 @@
-"""Test connection — POST /test-connection.
+"""Test connection — POST /test-connection."""
 
-Uses psycopg2 for a fast SELECT 1 check (~1–2s). Avoids tap-postgres subprocess
-which does full discovery and can exceed 60s for cloud DBs (Neon cold start).
-"""
-
-import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from core.config_builder import resolve_tap_type, test_connection_fast
+from core.connection_utils import test_sql_connection
+from core.connector_support import normalize_source_type
 
 logger = logging.getLogger("etl.test_connection")
 router = APIRouter()
@@ -18,20 +14,18 @@ router = APIRouter()
 
 class TestConnectionRequest(BaseModel):
     source_type: str | None = None
-    type: str | None = None  # Alias from NestJS
     connection_config: dict | None = None
-    source_config: dict | None = None
 
 
 @router.post("/test-connection")
 async def test_connection(body: TestConnectionRequest):
-    config = body.connection_config or body.source_config or {}
+    config = body.connection_config or {}
     if not config:
         raise HTTPException(status_code=400, detail="connection_config is required")
 
     try:
-        source_type = resolve_tap_type(body.source_type or body.type)
-    except ValueError as exc:
+        source_type = normalize_source_type(body.source_type)
+    except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     host = config.get("host", "?")
@@ -39,7 +33,7 @@ async def test_connection(body: TestConnectionRequest):
     dbname = config.get("dbname", config.get("database", "?"))
     logger.info("Testing connection to %s:%s/%s (source_type: %s)", host, port, dbname, source_type)
 
-    result = await asyncio.to_thread(test_connection_fast, config, source_type=source_type)
+    result = test_sql_connection(source_type, config)
 
     if result.get("success"):
         logger.info("Connection test PASSED for %s:%s/%s", host, port, dbname)
