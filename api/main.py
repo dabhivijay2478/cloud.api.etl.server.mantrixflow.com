@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="MANTrixFlow ETL Server",
-    description="dlt-based ETL service for SQL and MongoDB pipelines",
+    description="dlt-based ETL service for SQL database pipelines",
     version="2.0.0",
     lifespan=lifespan,
 )

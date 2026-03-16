@@ -370,6 +370,7 @@ def discover_sql_schema(
             streams.append(
                 {
                     "stream_name": stream_name,
+                    "schema_name": current_schema or "",
                     "tap_stream_id": stream_name,
                     "stream": stream_name,
                     "schema": {"properties": schema_properties},
